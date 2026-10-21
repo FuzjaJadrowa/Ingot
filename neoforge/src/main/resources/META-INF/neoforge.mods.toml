@@ -1,4 +1,4 @@
-﻿modLoader="javafml"
+modLoader="javafml"
 loaderVersion="[4,)"
 license="PIF-1.0"
 issueTrackerURL="https://github.com/FuzjaJadrowa/Ingot/issues"
@@ -7,8 +7,8 @@ issueTrackerURL="https://github.com/FuzjaJadrowa/Ingot/issues"
 modId="ingot"
 version="${mod_version}"
 displayName="Ingot"
-description='''Next-generation Minecraft world save system, which reduces size of the world.'''
-logoFile="../assets/ingot/icon.png"
+description='''Next-generation Minecraft world save system.'''
+logoFile="assets/ingot/icon.png"
 displayURL="https://fuzjajadrowa.pl"
 
 [[mixins]]
