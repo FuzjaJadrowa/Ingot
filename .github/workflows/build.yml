@@ -23,5 +23,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Ingot-build.${{ github.run_number }}
-          path: build/libs/Ingot-NeoForge-*.jar
+          path: build/libs/*.jar
           if-no-files-found: error
