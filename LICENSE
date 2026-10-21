@@ -1,0 +1,111 @@
+PIF (Pay It Forward) License
+
+Version 1.0 - 9 October 2026
+
+Copyright (c) 2026 FuzjaJadrowa
+
+Original Repository: https://github.com/FuzjaJadrowa/Ingot
+
+1. Definitions
+
+"Licensor" means the copyright holder(s) who make the Software available under this License.
+
+"Software" means the source code and associated materials expressly made available under this License, excluding third-party materials governed by their own licenses.
+
+"Covered Code" means copyright-protected code from the Software, including recognizable adaptations of that code, but not independent implementations of its ideas, functionality, methods, or interfaces.
+
+"Derived Project" means a project containing Covered Code, whether copied or adapted.
+
+"Independent Distribution" means publishing, offering, supplying, or making available a Derived Project as a separate product, mod, library, downloadable package, or software release. A Development Fork as defined below is not an Independent Distribution.
+
+"Development Fork" means a repository fork or copy maintained to inspect, test, modify, collaborate on, or propose contributions to the Software, clearly identifying the Original Repository and not promoted or released as an independent substitute for the Software.
+
+"Substantial Modification" means a genuine and material technical contribution that meaningfully changes, improves, or extends the Software's capabilities, functionality, architecture, performance, reliability, security, accessibility, or other practical behavior. Substantial Modification is assessed in the context of the Software as a whole, based on the significance of the changes rather than their number, size, or percentage of source code.
+
+"Standalone Rebranding" means an Independent Distribution of a Derived Project that is primarily a republished edition, replacement, or substitute for the Software and does not contain Substantial Modifications, regardless of the project's name, branding, or stated authorship.
+
+2. Permission Grant
+
+Subject to the terms of this License, the Licensor grants each recipient a non-exclusive, worldwide, royalty-free copyright license to:
+
+(a) Use, run, study, copy, and modify the Software, including privately and for commercial purposes;
+
+(b) Create and maintain Development Forks, including publicly accessible Development Forks;
+
+(c) Submit patches and pull requests to the Original Repository;
+
+(d) Copy and adapt portions of Covered Code for personal use or for a Derived Project distributed in accordance with this License;
+
+(e) Reference and use the Software as a build-time or runtime dependency, including through package managers, without requiring the independently written dependent project's source code to be published solely because of that dependency; and
+
+(f) Distribute Derived Projects only as permitted by Sections 3 and 4.
+
+All rights not expressly granted are reserved. Use of the Software as a dependency does not by itself authorize repackaging or redistributing copies of the Software.
+
+3. Redistribution Restrictions
+
+Without separate permission from the Licensor, you may not:
+
+(a) Redistribute the complete or substantially complete Software in unchanged form as a standalone download, package, mod release, mirror, or independently branded product; or
+
+(b) Independently distribute a Derived Project that constitutes Standalone Rebranding of the Software.
+
+For the purpose of Section 3(b), changes are not Substantial Modifications merely because they alter names, logos, icons, descriptions, metadata, licensing notices, packaging, formatting, code organization, or other superficial presentation details. Minor patches, trivial feature additions, or cosmetic alterations do not automatically constitute Substantial Modifications. Conversely, a genuinely significant improvement may qualify even if it changes relatively few lines of code.
+
+Whether a Derived Project contains Substantial Modifications must be assessed in good faith based on the actual technical nature and practical significance of the changes. No fixed percentage of copied, retained, modified, or newly written code determines the outcome. The number of added features alone is not decisive.
+
+This restriction does not prohibit incorporating limited portions of Covered Code into a broader independently developed project that is not primarily a republished edition, replacement, or substitute for the Software, provided the requirements of Section 4 are met.
+
+These restrictions do not prohibit private copies and modifications, Development Forks, or contributions sent to the Original Repository. A Development Fork may retain all of the Covered Code, including an unchanged copy, provided it remains a Development Fork rather than an Independent Distribution.
+
+4. Public Source and Attribution Requirements
+
+Whenever you Independently Distribute a permitted Derived Project containing Covered Code, you must:
+
+(a) Maintain a publicly readable source-code repository containing the corresponding human-authored source code of that Derived Project, including all Covered Code that you copied or modified, for as long as you continue distributing it;
+
+(b) Include in that repository and in accompanying documentation a clearly visible acknowledgment identifying the Original Repository by name and working URL;
+
+(c) Retain the original copyright notices and provide a copy of this License alongside the Covered Code;
+
+(d) Identify that the Derived Project contains code copied or adapted from the Software, and indicate that changes have been made; and
+
+(e) Ensure the published source corresponds to the version you distribute and is available without payment or special authorization.
+
+You retain copyright in all independently authored portions of your Derived Project and may select their license. Covered Code remains subject to this License.
+
+Public visibility of a repository does not, by itself, require you to authorize unrestricted reuse of your independently authored code.
+
+These obligations do not apply solely because a project takes inspiration from the Software without copying copyright-protected code, or solely because it references or uses the Software as an external dependency.
+
+For a Development Fork, preserve the original notices and provide a clear link to the Original Repository; the ordinary publicly visible fork repository satisfies the source-visibility requirement.
+
+5. Contributions
+
+You may submit pull requests or other contributions to the Original Repository.
+
+You retain ownership of your original contributions. Unless the parties agree otherwise, contributions intentionally submitted for inclusion are offered under this License, without transferring copyright ownership.
+
+Do not contribute code you lack permission to license on these terms.
+
+6. Separate Permissions and Other Rights
+
+The Licensor may grant additional or different permissions in writing.
+
+Nothing in this License removes rights granted under a different valid license for the same code, including rights already obtained under an earlier license.
+
+This License does not grant rights to third-party materials, trademarks, or branding except as necessary for truthful attribution.
+
+7. Termination
+
+Rights under this License terminate automatically if you violate its conditions.
+
+If you cure the violation within 30 days after becoming aware of it, your license is reinstated unless the Licensor has expressly and finally terminated your rights before the cure.
+
+Termination does not affect the rights of compliant downstream recipients or rights previously granted under other valid licenses.
+
+8. Disclaimer of Warranty and Limitation of Liability
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

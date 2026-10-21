@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "pl.fuzjajadrowa.ingot.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "MinecraftServerMixin",
+    "RegionFileStorageMixin",
+    "IOWorkerMixin"
+  ],
+  "injectors": {"defaultRequire": 1}
+}
