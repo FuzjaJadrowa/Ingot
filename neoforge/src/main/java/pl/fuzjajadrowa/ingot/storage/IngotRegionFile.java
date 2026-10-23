@@ -32,6 +32,7 @@ public final class IngotRegionFile implements AutoCloseable {
     private long end = HEADER_SIZE;
     private long generation;
     private long committedRecords;
+    private boolean dirty;
     private boolean closed;
     private IOException writeFailure;
     private Path recoveredTail;
@@ -253,12 +254,16 @@ public final class IngotRegionFile implements AutoCloseable {
         commit.putInt(COMMIT_MAGIC).putInt(total).putLong(generation + 1).putInt((int) recordCrc.getValue());
         commit.putInt(crc(commit.array(), 0, 20)).flip();
         try {
+            dirty = true;
             h.flip();
             writeFully(h, end);
             writeFully(ByteBuffer.wrap(compressed), end + RECORD_HEADER_SIZE);
             if (options.sync()) channel.force(false);
             writeFully(commit, end + RECORD_HEADER_SIZE + compressed.length);
-            if (options.sync()) channel.force(true);
+            if (options.sync()) {
+                channel.force(true);
+                dirty = false;
+            }
             index[slot] = type == 2 ? null : entry(h, end);
             generation++;
             committedRecords++;
@@ -271,15 +276,22 @@ public final class IngotRegionFile implements AutoCloseable {
 
     public synchronized void flush() throws IOException {
         checkOpen();
+        if (!dirty) return;
         try { channel.force(true); }
         catch (IOException e) { writeFailure = e; throw e; }
+        dirty = false;
     }
 
     @Override public synchronized void close() throws IOException {
         if (closed) return;
         closed = true;
         IOException failure = writeFailure;
-        try { channel.force(true); } catch (IOException e) { failure = collect(failure, e); }
+        if (dirty || writeFailure != null) {
+            try {
+                channel.force(true);
+                dirty = false;
+            } catch (IOException e) { failure = collect(failure, e); }
+        }
         try { lock.release(); } catch (IOException e) { failure = collect(failure, e); }
         try { channel.close(); } catch (IOException e) { failure = collect(failure, e); }
         if (failure != null) throw failure;
