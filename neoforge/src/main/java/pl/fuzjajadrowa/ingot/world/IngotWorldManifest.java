@@ -14,7 +14,7 @@ import java.util.zip.CRC32C;
 public record IngotWorldManifest(UUID worldId) {
     public static final String FILE_NAME = "ingot-manifest";
     private String body() {
-        return "format=ingot-region\nformatVersion=1\nimplementationVersion=0.1.0\n"
+        return "format=ingot-region\nformatVersion=1\nimplementationVersion=0.2.0\n"
                 + "storageMode=authoritative\nminecraft=1.21.1\nregionWidth=32\ncodec=1\nworldId=" + worldId + "\n";
     }
 

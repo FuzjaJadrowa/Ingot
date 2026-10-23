@@ -31,6 +31,7 @@ public final class IngotRegionFile implements AutoCloseable {
     private final Entry[] index = new Entry[1024];
     private long end = HEADER_SIZE;
     private long generation;
+    private long committedRecords;
     private boolean closed;
     private IOException writeFailure;
     private Path recoveredTail;
@@ -125,6 +126,7 @@ public final class IngotRegionFile implements AutoCloseable {
             int slot = slot(h.getInt(8), h.getInt(12));
             index[slot] = h.get(6) == 2 ? null : entry(h, end);
             generation = h.getLong(16);
+            committedRecords++;
             end += total;
         }
     }
@@ -178,6 +180,26 @@ public final class IngotRegionFile implements AutoCloseable {
     public synchronized boolean contains(int chunkX, int chunkZ) throws IOException {
         checkOpen();
         return index[checkedSlot(chunkX, chunkZ)] != null;
+    }
+
+    synchronized RegionStatistics statistics() throws IOException {
+        checkOpen();
+        long fileBytes = channel.size();
+        long liveRecordBytes = 0;
+        int liveChunks = 0;
+        for (Entry entry : index) {
+            if (entry != null) {
+                liveChunks++;
+                liveRecordBytes += RECORD_HEADER_SIZE + (long) entry.length() + COMMIT_SIZE;
+            }
+        }
+        long reclaimableBytes = Math.max(0, fileBytes - HEADER_SIZE - liveRecordBytes);
+        double obsoleteRatio = fileBytes == 0 ? 0 : (double) reclaimableBytes / fileBytes;
+        boolean recommended = fileBytes >= RegionStatistics.MINIMUM_FILE_BYTES
+                && reclaimableBytes >= RegionStatistics.MINIMUM_RECLAIMABLE_BYTES
+                && obsoleteRatio >= RegionStatistics.MINIMUM_OBSOLETE_RATIO;
+        return new RegionStatistics(fileBytes, committedRecords, liveChunks, liveRecordBytes,
+                reclaimableBytes, obsoleteRatio, generation, recommended);
     }
 
     public synchronized byte[] read(int chunkX, int chunkZ) throws IOException {
@@ -239,6 +261,7 @@ public final class IngotRegionFile implements AutoCloseable {
             if (options.sync()) channel.force(true);
             index[slot] = type == 2 ? null : entry(h, end);
             generation++;
+            committedRecords++;
             end += total;
         } catch (IOException e) {
             writeFailure = e;
