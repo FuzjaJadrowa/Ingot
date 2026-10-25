@@ -2,6 +2,7 @@ package pl.fuzjajadrowa.ingot.mixin;
 
 import pl.fuzjajadrowa.ingot.integration.IngotStorageAccess;
 import pl.fuzjajadrowa.ingot.integration.MinecraftIngotStorage;
+import pl.fuzjajadrowa.ingot.integration.VanillaRegionStorageTypes;
 import pl.fuzjajadrowa.ingot.world.IngotWorldManager;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.StreamTagVisitor;
@@ -16,23 +17,16 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.Set;
 
 @Mixin(RegionFileStorage.class)
 public abstract class RegionFileStorageMixin implements IngotStorageAccess {
-    private static final Set<String> INGOT_STORAGE_TYPES = Set.of("chunk", "entities", "poi");
-
     @Unique private MinecraftIngotStorage ingot$storage;
 
     @Inject(method = "<init>", at = @At("RETURN"))
     private void ingot$initialize(RegionStorageInfo info, Path folder, boolean sync, CallbackInfo ci) throws IOException {
-        if (!usesIngotStorageType(info.type())) return;
+        if (!VanillaRegionStorageTypes.usesIngotStorageType(info.type())) return;
         IngotWorldManager.Session session = IngotWorldManager.forFolder(folder);
         if (session != null) ingot$storage = new MinecraftIngotStorage(folder, sync, session);
-    }
-
-    static boolean usesIngotStorageType(String type) {
-        return INGOT_STORAGE_TYPES.contains(type);
     }
 
     @Override public MinecraftIngotStorage ingot$backend() { return ingot$storage; }

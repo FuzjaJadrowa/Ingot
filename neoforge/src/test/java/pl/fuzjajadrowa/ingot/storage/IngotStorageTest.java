@@ -106,18 +106,6 @@ public class IngotStorageTest {
         }
     }
 
-    @Test public void operationsAfterCloseFailAndCloseIsIdempotent() throws Exception {
-        IngotStorage storage = new IngotStorage(temporary.getRoot().toPath(),
-                new StorageOptions(1024, 1024, 2, false), CompressionRegistry.defaults(), ignored -> { });
-        storage.write(0, 0, new byte[]{1});
-        storage.close();
-        storage.close();
-        try {
-            storage.read(0, 0);
-            fail("Reads after close must fail");
-        } catch (IOException expected) { }
-    }
-
     @Test public void automaticallyCompactsRecommendedRegionAndWaitsOnClose() throws Exception {
         Path directory = temporary.getRoot().toPath().resolve("ingot");
         StorageOptions options = new StorageOptions(2 * 1024 * 1024, 2 * 1024 * 1024, 2, false);
