@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Stream;
 import java.util.function.Consumer;
 
 public final class IngotStorage implements AutoCloseable {
@@ -64,7 +65,14 @@ public final class IngotStorage implements AutoCloseable {
             RegionHandle handle = regions.get(key);
             if (handle == null) {
                 Path path = directory.resolve("r." + rx + "." + rz + ".ir");
-                if (!create && Files.notExists(path)) return null;
+                List<Path> candidates = compactionCandidates(path);
+                if (Files.notExists(path)) {
+                    if (!candidates.isEmpty()) {
+                        throw new IOException("Compaction recovery required for " + path
+                                + "; active region is missing and candidate files were preserved: " + candidates);
+                    }
+                    if (!create) return null;
+                }
                 while (regions.size() >= options.cachedRegions()) {
                     while (barrier) awaitStateChange();
                     if (closed) throw new IOException("Storage closed: " + directory);
@@ -85,6 +93,7 @@ public final class IngotStorage implements AutoCloseable {
                     handle = new RegionHandle(file);
                     regions.put(key, handle);
                     if (file.recoveredTail() != null) recoveryReporter.accept(file.recoveredTail());
+                    discardOrphanCandidates(path, candidates);
                 }
             }
             handle.activeOperations++;
@@ -92,6 +101,31 @@ public final class IngotStorage implements AutoCloseable {
             return handle;
         } finally {
             cacheLock.unlock();
+        }
+    }
+
+    private List<Path> compactionCandidates(Path regionPath) throws IOException {
+        if (Files.notExists(directory)) return List.of();
+        String prefix = regionPath.getFileName() + ".compacting-";
+        try (Stream<Path> entries = Files.list(directory)) {
+            return entries.filter(entry -> {
+                String name = entry.getFileName().toString();
+                return name.startsWith(prefix) && !name.endsWith(".lock");
+            }).toList();
+        }
+    }
+
+    private void discardOrphanCandidates(Path regionPath, List<Path> candidates) {
+        for (Path candidate : candidates) {
+            try {
+                Files.deleteIfExists(candidate);
+                Files.deleteIfExists(candidate.resolveSibling(candidate.getFileName() + ".lock"));
+                LOGGER.log(System.Logger.Level.WARNING,
+                        "Removed stale compaction candidate because the active region validated: " + candidate);
+            } catch (IOException cleanupFailure) {
+                reportCompactionFailure(new IOException("Could not clean stale compaction candidate for "
+                        + regionPath + ": " + candidate, cleanupFailure));
+            }
         }
     }
 

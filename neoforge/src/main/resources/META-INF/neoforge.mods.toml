@@ -9,7 +9,7 @@ version="${mod_version}"
 displayName="Ingot"
 description='''Next-generation Minecraft world save system.'''
 logoFile="assets/ingot/icon.png"
-displayURL="https://fuzjajadrowa.pl"
+displayURL="https://modrinth.com/mod/ingot"
 
 [[mixins]]
 config="ingot.mixins.json"

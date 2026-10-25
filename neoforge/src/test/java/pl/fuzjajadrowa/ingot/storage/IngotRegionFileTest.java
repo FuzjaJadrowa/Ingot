@@ -12,7 +12,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.Arrays;
+import java.util.UUID;
 import java.util.Random;
 import java.util.zip.CRC32C;
 
@@ -68,6 +68,56 @@ public class IngotRegionFileTest {
             assertArrayEquals(latest, reopened.read(7, 9));
             assertEquals(2, reopened.statistics().committedRecords());
         }
+    }
+
+    @Test public void readsRegionBuiltFromVersion010FormatWithoutRewritingIt() throws Exception {
+        Path path = regionPath("r.0.0.ir");
+        byte[] payload = "fixture written with the 0.1.0 region-v1 layout".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] fixture = version010Fixture(3, 5, payload);
+        Files.write(path, fixture);
+
+        try (IngotRegionFile region = open(path, 0, 0)) {
+            assertArrayEquals(payload, region.read(3, 5));
+            assertEquals(1, region.statistics().generation());
+            assertEquals(1, region.statistics().committedRecords());
+        }
+        assertArrayEquals("Opening an old region must not rewrite it", fixture, Files.readAllBytes(path));
+    }
+
+    /** Encodes the v1 fields as implemented by the 0.1.0 source, independently of IngotRegionFile.write(). */
+    private byte[] version010Fixture(int chunkX, int chunkZ, byte[] payload) throws IOException {
+        byte[] compressed = codecs.require(1).compress(payload);
+        ByteBuffer header = ByteBuffer.allocate(64).order(ByteOrder.BIG_ENDIAN);
+        UUID id = UUID.fromString("4dc5b041-742c-45eb-9033-306932c5c5a9");
+        header.putInt(0x494e4754).putInt(1).putInt(64).putInt(0).putInt(0).putInt(0);
+        header.putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits());
+        header.position(60);
+        header.putInt(testCrc(header.array(), 0, 60));
+
+        ByteBuffer record = ByteBuffer.allocate(48).order(ByteOrder.BIG_ENDIAN);
+        record.putInt(0x49524344).putShort((short) 48).put((byte) 1).put((byte) 1);
+        record.putInt(chunkX).putInt(chunkZ).putLong(1).putInt(compressed.length).putInt(payload.length);
+        record.putInt(testCrc(payload, 0, payload.length));
+        record.position(44);
+        record.putInt(testCrc(record.array(), 0, 44));
+
+        int totalRecordBytes = 48 + compressed.length + 24;
+        CRC32C recordCrc = new CRC32C();
+        recordCrc.update(record.array());
+        recordCrc.update(compressed);
+        ByteBuffer commit = ByteBuffer.allocate(24).order(ByteOrder.BIG_ENDIAN);
+        commit.putInt(0x49434d54).putInt(totalRecordBytes).putLong(1).putInt((int) recordCrc.getValue());
+        commit.putInt(testCrc(commit.array(), 0, 20));
+
+        ByteBuffer file = ByteBuffer.allocate(64 + totalRecordBytes);
+        file.put(header.array()).put(record.array()).put(compressed).put(commit.array());
+        return file.array();
+    }
+
+    private static int testCrc(byte[] bytes, int offset, int length) {
+        CRC32C crc = new CRC32C();
+        crc.update(bytes, offset, length);
+        return (int) crc.getValue();
     }
 
     @Test public void tombstonesStayDeletedAcrossReopen() throws Exception {

@@ -136,4 +136,65 @@ public class IngotStorageTest {
             assertArrayEquals(payload, compacted.read(0, 0));
         }
     }
+
+    @Test public void removesOrphanCandidateOnlyAfterActiveRegionValidates() throws Exception {
+        Path directory = temporary.getRoot().toPath().resolve("ingot");
+        Files.createDirectories(directory);
+        Path regionPath = directory.resolve("r.0.0.ir");
+        try (IngotRegionFile region = new IngotRegionFile(regionPath, 0, 0,
+                new StorageOptions(1024, 1024, 2, false), CompressionRegistry.defaults())) {
+            region.write(0, 0, new byte[]{7, 8, 9});
+        }
+        Path candidate = directory.resolve("r.0.0.ir.compacting-interrupted");
+        Path candidateLock = candidate.resolveSibling(candidate.getFileName() + ".lock");
+        Files.write(candidate, new byte[]{1, 2, 3});
+        Files.write(candidateLock, new byte[0]);
+
+        try (IngotStorage storage = new IngotStorage(directory,
+                new StorageOptions(1024, 1024, 2, false), CompressionRegistry.defaults(), ignored -> { })) {
+            assertArrayEquals(new byte[]{7, 8, 9}, storage.read(0, 0));
+        }
+        assertFalse(Files.exists(candidate));
+        assertFalse(Files.exists(candidateLock));
+    }
+
+    @Test public void missingActiveRegionDoesNotFallBackToCandidate() throws Exception {
+        Path directory = temporary.getRoot().toPath().resolve("ingot");
+        Files.createDirectories(directory);
+        Path orphan = directory.resolve("r.0.0.ir.compacting-orphan");
+        Files.write(orphan, new byte[]{1, 2, 3});
+        try (IngotStorage storage = new IngotStorage(directory,
+                new StorageOptions(1024, 1024, 2, false), CompressionRegistry.defaults(), ignored -> { })) {
+            try {
+                storage.read(0, 0);
+                fail("Missing active region with a candidate must be an explicit recovery error");
+            } catch (IOException expected) { assertTrue(expected.getMessage().contains("recovery required")); }
+        }
+        assertTrue(Files.exists(orphan));
+        assertFalse(Files.exists(directory.resolve("r.0.0.ir")));
+    }
+
+    @Test public void damagedActiveRegionPreservesCandidateForInvestigation() throws Exception {
+        Path directory = temporary.getRoot().toPath().resolve("ingot");
+        Files.createDirectories(directory);
+        Path regionPath = directory.resolve("r.0.0.ir");
+        try (IngotRegionFile region = new IngotRegionFile(regionPath, 0, 0,
+                new StorageOptions(1024, 1024, 2, false), CompressionRegistry.defaults())) {
+            region.write(0, 0, new byte[]{4});
+        }
+        byte[] header = Files.readAllBytes(regionPath);
+        header[0] ^= 1;
+        Files.write(regionPath, header);
+        Path orphan = directory.resolve("r.0.0.ir.compacting-possible-recovery");
+        Files.write(orphan, new byte[]{5, 6, 7});
+
+        try (IngotStorage storage = new IngotStorage(directory,
+                new StorageOptions(1024, 1024, 2, false), CompressionRegistry.defaults(), ignored -> { })) {
+            try {
+                storage.read(0, 0);
+                fail("Damaged active region must fail rather than fall back");
+            } catch (CorruptRegionException expected) { }
+        }
+        assertTrue(Files.exists(orphan));
+    }
 }
