@@ -9,6 +9,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -46,6 +47,8 @@ public final class IngotStorage implements AutoCloseable {
             if (closed) throw new IOException("Storage closed: " + directory);
             int rx = x >> 5, rz = z >> 5;
             long key = ((long) rx << 32) | Integer.toUnsignedLong(rz);
+            while (barrier) awaitStateChange();
+            if (closed) throw new IOException("Storage closed: " + directory);
             RegionHandle handle = regions.get(key);
             if (handle == null) {
                 Path path = directory.resolve("r." + rx + "." + rz + ".ir");
@@ -53,21 +56,24 @@ public final class IngotStorage implements AutoCloseable {
                 while (regions.size() >= options.cachedRegions()) {
                     while (barrier) awaitStateChange();
                     if (closed) throw new IOException("Storage closed: " + directory);
-                    RegionHandle evicted = evictIdleRegion();
+                    Map.Entry<Long, RegionHandle> evicted = evictIdleRegion();
                     if (evicted == null) {
                         awaitStateChange();
                         if (closed) throw new IOException("Storage closed: " + directory);
                     } else {
-                        cacheLock.unlock();
-                        try { evicted.file.close(); }
-                        finally { cacheLock.lock(); }
+                        evicted.getValue().file.close();
                     }
                 }
-                if (create) Files.createDirectories(directory);
-                IngotRegionFile file = new IngotRegionFile(path, rx, rz, options, codecs);
-                handle = new RegionHandle(file);
-                regions.put(key, handle);
-                if (file.recoveredTail() != null) recoveryReporter.accept(file.recoveredTail());
+                while (barrier) awaitStateChange();
+                if (closed) throw new IOException("Storage closed: " + directory);
+                handle = regions.get(key);
+                if (handle == null) {
+                    if (create) Files.createDirectories(directory);
+                    IngotRegionFile file = new IngotRegionFile(path, rx, rz, options, codecs);
+                    handle = new RegionHandle(file);
+                    regions.put(key, handle);
+                    if (file.recoveredTail() != null) recoveryReporter.accept(file.recoveredTail());
+                }
             }
             handle.activeOperations++;
             activeOperations++;
@@ -77,13 +83,15 @@ public final class IngotStorage implements AutoCloseable {
         }
     }
 
-    private RegionHandle evictIdleRegion() {
+    private Map.Entry<Long, RegionHandle> evictIdleRegion() {
         Iterator<Map.Entry<Long, RegionHandle>> iterator = regions.entrySet().iterator();
         while (iterator.hasNext()) {
-            RegionHandle candidate = iterator.next().getValue();
+            Map.Entry<Long, RegionHandle> entry = iterator.next();
+            RegionHandle candidate = entry.getValue();
             if (candidate.activeOperations == 0) {
+                Map.Entry<Long, RegionHandle> removed = Map.entry(entry.getKey(), candidate);
                 iterator.remove();
-                return candidate;
+                return removed;
             }
         }
         return null;
@@ -127,6 +135,16 @@ public final class IngotStorage implements AutoCloseable {
         RegionHandle handle = acquire(x, z, payload != null);
         if (handle == null) return;
         try { handle.file.write(x, z, payload); }
+        finally { release(handle); }
+    }
+
+    void compactRegion(int x, int z) throws IOException {
+        RegionHandle handle = acquire(x, z, false);
+        if (handle == null) return;
+        int regionX = x >> 5, regionZ = z >> 5;
+        Path regionPath = directory.resolve("r." + regionX + "." + regionZ + ".ir");
+        Path candidate = directory.resolve(regionPath.getFileName() + ".compacting-" + UUID.randomUUID());
+        try { handle.file.compactTo(candidate); }
         finally { release(handle); }
     }
 

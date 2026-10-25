@@ -3,6 +3,7 @@ package pl.fuzjajadrowa.ingot.storage;
 import pl.fuzjajadrowa.ingot.compression.CompressionRegistry;
 import java.io.EOFException;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
@@ -26,8 +27,10 @@ public final class IngotRegionFile implements AutoCloseable {
     private final int regionZ;
     private final StorageOptions options;
     private final CompressionRegistry codecs;
-    private final FileChannel channel;
-    private final FileLock lock;
+    private FileChannel channel;
+    private FileLock lock;
+    private final FileChannel stableLockChannel;
+    private final FileLock stableLock;
     private final Entry[] index = new Entry[1024];
     private long end = HEADER_SIZE;
     private long generation;
@@ -46,28 +49,41 @@ public final class IngotRegionFile implements AutoCloseable {
         this.regionZ = regionZ;
         this.options = options;
         this.codecs = codecs;
-        FileChannel opened;
-        boolean created;
-        try {
-            opened = FileChannel.open(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE);
-            created = true;
-        } catch (FileAlreadyExistsException e) {
-            opened = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
-            created = false;
-        }
+        FileChannel stableChannel = null;
+        FileLock acquiredStableLock = null;
+        FileChannel opened = null;
         FileLock acquired = null;
         try {
+            Path stableLockPath = path.resolveSibling(path.getFileName() + ".lock");
+            stableChannel = FileChannel.open(stableLockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            try { acquiredStableLock = stableChannel.tryLock(); }
+            catch (OverlappingFileLockException e) { throw new IOException("Region already open: " + path, e); }
+            if (acquiredStableLock == null) throw new IOException("Region locked by another process: " + path);
+
+            boolean created;
+            try {
+                opened = FileChannel.open(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE);
+                created = true;
+            } catch (FileAlreadyExistsException e) {
+                opened = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
+                created = false;
+            }
             try { acquired = opened.tryLock(); }
             catch (OverlappingFileLockException e) { throw new IOException("Region already open: " + path, e); }
             if (acquired == null) throw new IOException("Region locked by another process: " + path);
+
             this.channel = opened;
             this.lock = acquired;
+            this.stableLockChannel = stableChannel;
+            this.stableLock = acquiredStableLock;
             if (created) initialize();
             else validateHeader();
             restoreIndex();
         } catch (IOException | RuntimeException | Error e) {
             if (acquired != null) try { acquired.release(); } catch (IOException suppressed) { e.addSuppressed(suppressed); }
-            try { opened.close(); } catch (IOException suppressed) { e.addSuppressed(suppressed); }
+            if (opened != null) try { opened.close(); } catch (IOException suppressed) { e.addSuppressed(suppressed); }
+            if (acquiredStableLock != null) try { acquiredStableLock.release(); } catch (IOException suppressed) { e.addSuppressed(suppressed); }
+            if (stableChannel != null) try { stableChannel.close(); } catch (IOException suppressed) { e.addSuppressed(suppressed); }
             throw e;
         }
     }
@@ -203,6 +219,167 @@ public final class IngotRegionFile implements AutoCloseable {
                 reclaimableBytes, obsoleteRatio, generation, recommended);
     }
 
+    synchronized void writeCompactedCandidate(Path candidate) throws IOException {
+        checkOpen();
+        Path source = path.toAbsolutePath().normalize();
+        Path target = candidate.toAbsolutePath().normalize();
+        if (source.equals(target) || !source.getParent().equals(target.getParent())) {
+            throw new IOException("Compaction candidate must be a different file in the region directory");
+        }
+
+        try (FileChannel output = FileChannel.open(candidate, StandardOpenOption.CREATE_NEW,
+                StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            writeRegionHeader(output, regionX, regionZ);
+            long outputEnd = HEADER_SIZE;
+            long outputGeneration = 0;
+            for (int slot = 0; slot < index.length; slot++) {
+                Entry current = index[slot];
+                if (current == null) continue;
+
+                int chunkX = (regionX << 5) + (slot & 31);
+                int chunkZ = (regionZ << 5) + (slot >>> 5);
+                byte[] originalPayload = read(chunkX, chunkZ);
+                ByteBuffer originalHeader = readBuffer(RECORD_HEADER_SIZE, current.offset());
+                byte[] compressed = readBuffer(current.length(), current.offset() + RECORD_HEADER_SIZE).array();
+                int codec = Byte.toUnsignedInt(originalHeader.get(7));
+                int rawLength = originalHeader.getInt(28);
+                int rawCrc = originalHeader.getInt(32);
+
+                ByteBuffer recordHeader = buffer(RECORD_HEADER_SIZE);
+                recordHeader.putInt(RECORD_MAGIC).putShort((short) RECORD_HEADER_SIZE).put((byte) 1).put((byte) codec);
+                recordHeader.putInt(chunkX).putInt(chunkZ).putLong(++outputGeneration);
+                recordHeader.putInt(compressed.length).putInt(rawLength).putInt(rawCrc);
+                recordHeader.position(44);
+                recordHeader.putInt(crc(recordHeader.array(), 0, 44));
+
+                CRC32C recordChecksum = new CRC32C();
+                recordChecksum.update(recordHeader.array());
+                recordChecksum.update(compressed);
+                int recordLength = RECORD_HEADER_SIZE + compressed.length + COMMIT_SIZE;
+                ByteBuffer commit = buffer(COMMIT_SIZE);
+                commit.putInt(COMMIT_MAGIC).putInt(recordLength).putLong(outputGeneration)
+                        .putInt((int) recordChecksum.getValue());
+                commit.putInt(crc(commit.array(), 0, 20));
+
+                recordHeader.flip();
+                commit.flip();
+                writeFully(output, recordHeader, outputEnd);
+                writeFully(output, ByteBuffer.wrap(compressed), outputEnd + RECORD_HEADER_SIZE);
+                writeFully(output, commit, outputEnd + RECORD_HEADER_SIZE + compressed.length);
+                outputEnd += recordLength;
+
+                if (!java.util.Arrays.equals(originalPayload, decompress(codec, compressed, rawLength, rawCrc))) {
+                    throw corrupt("Payload changed while building compacted candidate");
+                }
+            }
+            output.force(true);
+        }
+
+        Path candidateLock = candidate.resolveSibling(candidate.getFileName() + ".lock");
+        try {
+            try (IngotRegionFile verified = new IngotRegionFile(candidate, regionX, regionZ, options, codecs)) {
+                for (int slot = 0; slot < index.length; slot++) {
+                    if (index[slot] == null) continue;
+                    int chunkX = (regionX << 5) + (slot & 31);
+                    int chunkZ = (regionZ << 5) + (slot >>> 5);
+                    if (!java.util.Arrays.equals(read(chunkX, chunkZ), verified.read(chunkX, chunkZ))) {
+                        throw verified.corrupt("Compacted candidate payload validation failed");
+                    }
+                }
+            }
+        } finally {
+            Files.deleteIfExists(candidateLock);
+        }
+    }
+
+    synchronized void compactTo(Path candidate) throws IOException {
+        checkOpen();
+        writeCompactedCandidate(candidate);
+        if (dirty) {
+            channel.force(true);
+            dirty = false;
+        }
+
+        FileChannel oldChannel = channel;
+        FileLock oldLock = lock;
+        channel = null;
+        lock = null;
+        IOException closeFailure = null;
+        try { oldLock.release(); } catch (IOException e) { closeFailure = e; }
+        try { oldChannel.close(); } catch (IOException e) { closeFailure = collect(closeFailure, e); }
+        if (closeFailure != null) {
+            try { reopenCurrentFile(); } catch (IOException e) {
+                closeFailure.addSuppressed(e);
+                writeFailure = closeFailure;
+            }
+            throw closeFailure;
+        }
+
+        try {
+            Files.move(candidate, path, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException moveFailure) {
+            try { reopenCurrentFile(); } catch (IOException e) {
+                moveFailure.addSuppressed(e);
+                writeFailure = moveFailure;
+            }
+            throw moveFailure;
+        }
+        try {
+            reopenCurrentFile();
+        } catch (IOException reopenFailure) {
+            writeFailure = reopenFailure;
+            throw reopenFailure;
+        }
+    }
+
+    private void reopenCurrentFile() throws IOException {
+        FileChannel opened = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        FileLock acquired = null;
+        try {
+            try { acquired = opened.tryLock(); }
+            catch (OverlappingFileLockException e) { throw new IOException("Region already open: " + path, e); }
+            if (acquired == null) throw new IOException("Region locked by another process: " + path);
+            channel = opened;
+            lock = acquired;
+            java.util.Arrays.fill(index, null);
+            end = HEADER_SIZE;
+            generation = 0;
+            committedRecords = 0;
+            dirty = false;
+            writeFailure = null;
+            validateHeader();
+            restoreIndex();
+        } catch (IOException | RuntimeException | Error e) {
+            if (acquired != null) try { acquired.release(); } catch (IOException suppressed) { e.addSuppressed(suppressed); }
+            try { opened.close(); } catch (IOException suppressed) { e.addSuppressed(suppressed); }
+            channel = null;
+            lock = null;
+            throw e;
+        }
+    }
+
+    private static void writeRegionHeader(FileChannel output, int regionX, int regionZ) throws IOException {
+        ByteBuffer header = buffer(HEADER_SIZE);
+        UUID id = UUID.randomUUID();
+        header.putInt(MAGIC).putInt(1).putInt(HEADER_SIZE).putInt(regionX).putInt(regionZ).putInt(0);
+        header.putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits());
+        header.position(60);
+        header.putInt(crc(header.array(), 0, 60));
+        header.flip();
+        writeFully(output, header, 0);
+    }
+
+    private byte[] decompress(int codec, byte[] compressed, int rawLength, int rawCrc) throws IOException {
+        byte[] raw;
+        try { raw = codecs.require(codec).decompress(compressed, rawLength); }
+        catch (IOException e) { throw new CorruptRegionException("Cannot validate compacted payload in " + path, e); }
+        if (raw.length != rawLength || crc(raw, 0, raw.length) != rawCrc) {
+            throw corrupt("Compacted payload checksum/length mismatch");
+        }
+        return raw;
+    }
+
     public synchronized byte[] read(int chunkX, int chunkZ) throws IOException {
         checkOpen();
         Entry entry = index[checkedSlot(chunkX, chunkZ)];
@@ -286,14 +463,16 @@ public final class IngotRegionFile implements AutoCloseable {
         if (closed) return;
         closed = true;
         IOException failure = writeFailure;
-        if (dirty || writeFailure != null) {
+        if (channel != null && (dirty || writeFailure != null)) {
             try {
                 channel.force(true);
                 dirty = false;
             } catch (IOException e) { failure = collect(failure, e); }
         }
-        try { lock.release(); } catch (IOException e) { failure = collect(failure, e); }
-        try { channel.close(); } catch (IOException e) { failure = collect(failure, e); }
+        if (lock != null) try { lock.release(); } catch (IOException e) { failure = collect(failure, e); }
+        if (channel != null) try { channel.close(); } catch (IOException e) { failure = collect(failure, e); }
+        try { stableLock.release(); } catch (IOException e) { failure = collect(failure, e); }
+        try { stableLockChannel.close(); } catch (IOException e) { failure = collect(failure, e); }
         if (failure != null) throw failure;
     }
 
@@ -335,6 +514,14 @@ public final class IngotRegionFile implements AutoCloseable {
         while (bytes.hasRemaining()) {
             int count = channel.write(bytes, offset);
             if (count <= 0) throw new IOException("Write made no progress: " + path);
+            offset += count;
+        }
+    }
+
+    private static void writeFully(FileChannel target, ByteBuffer bytes, long offset) throws IOException {
+        while (bytes.hasRemaining()) {
+            int count = target.write(bytes, offset);
+            if (count <= 0) throw new IOException("Write made no progress while building compacted candidate");
             offset += count;
         }
     }
