@@ -27,7 +27,8 @@ public final class MinecraftIngotStorage implements AutoCloseable {
         this.session = session;
         this.options = StorageOptions.defaults(sync);
         this.storage = new IngotStorage(vanillaFolder.resolve("ingot"), options, CompressionRegistry.defaults(),
-                path -> Ingot.LOGGER.warn("Recovered incomplete Ingot append; original tail preserved at {}", path));
+                path -> Ingot.LOGGER.warn("Recovered incomplete Ingot append; original tail preserved at {}", path),
+                failure -> Ingot.LOGGER.error("Background Ingot compaction failed; the source region remains active", failure));
         session.register(storage);
     }
 

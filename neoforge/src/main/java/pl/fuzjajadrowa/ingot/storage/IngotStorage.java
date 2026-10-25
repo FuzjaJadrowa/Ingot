@@ -15,6 +15,8 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
 public final class IngotStorage implements AutoCloseable {
+    private static final System.Logger LOGGER = System.getLogger(IngotStorage.class.getName());
+
     private static final class RegionHandle {
         private final IngotRegionFile file;
         private int activeOperations;
@@ -26,6 +28,8 @@ public final class IngotStorage implements AutoCloseable {
     private final StorageOptions options;
     private final CompressionRegistry codecs;
     private final Consumer<Path> recoveryReporter;
+    private final Consumer<Throwable> compactionErrorReporter;
+    private final BoundedCompactionScheduler compactionScheduler;
     private final Map<Long, RegionHandle> regions = new LinkedHashMap<>(16, 0.75f, true);
     private final ReentrantLock cacheLock = new ReentrantLock();
     private final Condition stateChanged = cacheLock.newCondition();
@@ -34,10 +38,18 @@ public final class IngotStorage implements AutoCloseable {
     private int activeOperations;
 
     public IngotStorage(Path directory, StorageOptions options, CompressionRegistry codecs, Consumer<Path> recoveryReporter) {
+        this(directory, options, codecs, recoveryReporter, failure ->
+                LOGGER.log(System.Logger.Level.ERROR, "Background Ingot compaction failed", failure));
+    }
+
+    public IngotStorage(Path directory, StorageOptions options, CompressionRegistry codecs,
+                        Consumer<Path> recoveryReporter, Consumer<Throwable> compactionErrorReporter) {
         this.directory = directory;
         this.options = options;
         this.codecs = codecs;
         this.recoveryReporter = recoveryReporter;
+        this.compactionErrorReporter = compactionErrorReporter;
+        this.compactionScheduler = new BoundedCompactionScheduler(this::reportCompactionFailure);
     }
 
     private RegionHandle acquire(int x, int z, boolean create) throws IOException {
@@ -134,7 +146,21 @@ public final class IngotStorage implements AutoCloseable {
     public void write(int x, int z, byte[] payload) throws IOException {
         RegionHandle handle = acquire(x, z, payload != null);
         if (handle == null) return;
-        try { handle.file.write(x, z, payload); }
+        try {
+            handle.file.write(x, z, payload);
+            try {
+                if (handle.file.statistics().compactionRecommended()) {
+                    int regionX = x >> 5, regionZ = z >> 5;
+                    long key = ((long) regionX << 32) | Integer.toUnsignedLong(regionZ);
+                    compactionScheduler.schedule(key, () -> {
+                        try { compactRegion(regionX << 5, regionZ << 5); }
+                        catch (IOException e) { throw new java.io.UncheckedIOException(e); }
+                    });
+                }
+            } catch (IOException statisticsFailure) {
+                reportCompactionFailure(statisticsFailure);
+            }
+        }
         finally { release(handle); }
     }
 
@@ -146,6 +172,14 @@ public final class IngotStorage implements AutoCloseable {
         Path candidate = directory.resolve(regionPath.getFileName() + ".compacting-" + UUID.randomUUID());
         try { handle.file.compactTo(candidate); }
         finally { release(handle); }
+    }
+
+    private void reportCompactionFailure(Throwable failure) {
+        try { compactionErrorReporter.accept(failure); }
+        catch (Throwable reportingFailure) {
+            if (reportingFailure != failure) failure.addSuppressed(reportingFailure);
+            LOGGER.log(System.Logger.Level.ERROR, "Unable to report Ingot compaction failure", failure);
+        }
     }
 
     public void flush() throws IOException {
@@ -187,6 +221,7 @@ public final class IngotStorage implements AutoCloseable {
     }
 
     @Override public void close() throws IOException {
+        compactionScheduler.close();
         List<IngotRegionFile> files;
         cacheLock.lock();
         try {

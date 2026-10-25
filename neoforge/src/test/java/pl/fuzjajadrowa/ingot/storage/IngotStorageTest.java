@@ -117,4 +117,23 @@ public class IngotStorageTest {
             fail("Reads after close must fail");
         } catch (IOException expected) { }
     }
+
+    @Test public void automaticallyCompactsRecommendedRegionAndWaitsOnClose() throws Exception {
+        Path directory = temporary.getRoot().toPath().resolve("ingot");
+        StorageOptions options = new StorageOptions(2 * 1024 * 1024, 2 * 1024 * 1024, 2, false);
+        java.util.concurrent.atomic.AtomicReference<Throwable> reported = new java.util.concurrent.atomic.AtomicReference<>();
+        IngotStorage storage = new IngotStorage(directory, options, CompressionRegistry.defaults(), ignored -> { },
+                reported::set);
+        byte[] payload = new byte[1_100_000];
+        new java.util.Random(901).nextBytes(payload);
+        storage.write(0, 0, payload);
+        storage.write(0, 0, payload);
+        storage.close();
+        assertNull(reported.get());
+        try (IngotRegionFile compacted = new IngotRegionFile(directory.resolve("r.0.0.ir"), 0, 0,
+                options, CompressionRegistry.defaults())) {
+            assertEquals(1, compacted.statistics().committedRecords());
+            assertArrayEquals(payload, compacted.read(0, 0));
+        }
+    }
 }
