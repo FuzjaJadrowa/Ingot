@@ -16,6 +16,11 @@ import java.util.UUID;
 import java.util.zip.CRC32C;
 
 public final class IngotRegionFile implements AutoCloseable {
+    @FunctionalInterface
+    interface RegionPublisher {
+        void publish(Path candidate, Path target) throws IOException;
+    }
+
     public static final int HEADER_SIZE = 64;
     public static final int RECORD_HEADER_SIZE = 48;
     public static final int COMMIT_SIZE = 24;
@@ -293,6 +298,12 @@ public final class IngotRegionFile implements AutoCloseable {
     }
 
     synchronized void compactTo(Path candidate) throws IOException {
+        compactTo(candidate, (source, target) -> Files.move(source, target,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING));
+    }
+
+    synchronized void compactTo(Path candidate, RegionPublisher publisher) throws IOException {
         checkOpen();
         writeCompactedCandidate(candidate);
         if (dirty) {
@@ -316,8 +327,7 @@ public final class IngotRegionFile implements AutoCloseable {
         }
 
         try {
-            Files.move(candidate, path, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
-                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            publisher.publish(candidate, path);
         } catch (IOException moveFailure) {
             try { reopenCurrentFile(); } catch (IOException e) {
                 moveFailure.addSuppressed(e);

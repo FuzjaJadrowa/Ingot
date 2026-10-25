@@ -309,4 +309,31 @@ public class IngotRegionFileTest {
             assertArrayEquals(payload, region.read(0, 0));
         }
     }
+
+    @Test public void failedAtomicPublicationReopensSourceAndPreservesVerifiedCandidate() throws Exception {
+        Path path = regionPath("r.0.0.ir");
+        Path candidate = regionPath("r.0.0.ir.compacting-test");
+        byte[] latest = {9, 8, 7, 6};
+        try (IngotRegionFile region = open(path, 0, 0)) {
+            region.write(0, 0, new byte[]{1, 2, 3});
+            region.write(0, 0, latest);
+            try {
+                region.compactTo(candidate, (source, target) -> {
+                    throw new IOException("injected atomic publication failure");
+                });
+                fail("Injected publication failure must be reported");
+            } catch (IOException expected) {
+                assertEquals("injected atomic publication failure", expected.getMessage());
+            }
+
+            assertTrue("Verified candidate must remain available for inspection", Files.exists(candidate));
+            assertFalse("Candidate lock must be released before publication", Files.exists(
+                    candidate.resolveSibling(candidate.getFileName() + ".lock")));
+            assertArrayEquals(latest, region.read(0, 0));
+        }
+
+        try (IngotRegionFile reopened = open(path, 0, 0)) {
+            assertArrayEquals(latest, reopened.read(0, 0));
+        }
+    }
 }
