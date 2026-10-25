@@ -18,7 +18,14 @@ jobs:
       - name: Grant execute permission for Gradle wrapper
         run: chmod +x gradlew
       - name: Build NeoForge mod
-        run: ./gradlew clean :neoforge:build
+        run: ./gradlew clean :neoforge:test :neoforge:build
+      - name: Upload JUnit reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ingot-test-reports.${{ github.run_number }}
+          path: neoforge/build/test-results/test/*.xml
+          if-no-files-found: ignore
       - name: Upload mod JAR
         uses: actions/upload-artifact@v4
         with:
