@@ -30,8 +30,32 @@ public class BoundedCompactionSchedulerTest {
             release.countDown();
             scheduler.close();
         }
-        assertEquals(3, completed.get());
+        assertEquals(4, completed.get());
         assertFalse(scheduler.schedule(5, completed::incrementAndGet));
+    }
+
+    @Test public void coalescesWritesDuringRunningCompactionIntoOneFollowUp() throws Exception {
+        CountDownLatch firstRun = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger runs = new AtomicInteger();
+        BoundedCompactionScheduler scheduler = new BoundedCompactionScheduler(failure -> fail(failure.toString()));
+        try {
+            assertTrue(scheduler.schedule(9, () -> {
+                if (runs.incrementAndGet() == 1) {
+                    firstRun.countDown();
+                    try { release.await(); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+                }
+            }));
+            assertTrue(firstRun.await(5, TimeUnit.SECONDS));
+            assertFalse(scheduler.schedule(9, runs::incrementAndGet));
+            assertFalse(scheduler.schedule(9, runs::incrementAndGet));
+            release.countDown();
+        } finally {
+            release.countDown();
+            scheduler.close();
+        }
+        assertEquals("duplicate writes coalesce to one additional run", 2, runs.get());
     }
 
     @Test public void reportsTaskFailuresAndContinuesProcessing() {
@@ -47,5 +71,31 @@ public class BoundedCompactionSchedulerTest {
             Thread.currentThread().interrupt();
             fail(e.toString());
         } finally { scheduler.close(); }
+    }
+
+    @Test public void rejectedRegionCanBeRetriedAfterQueueSpaceOpens() throws Exception {
+        CountDownLatch running = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch queuedDone = new CountDownLatch(2);
+        CountDownLatch retryDone = new CountDownLatch(1);
+        BoundedCompactionScheduler scheduler = new BoundedCompactionScheduler(failure -> fail(failure.toString()));
+        try {
+            assertTrue(scheduler.schedule(1, () -> {
+                running.countDown();
+                try { release.await(); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+            }));
+            assertTrue(running.await(5, TimeUnit.SECONDS));
+            assertTrue(scheduler.schedule(2, queuedDone::countDown));
+            assertTrue(scheduler.schedule(3, queuedDone::countDown));
+            assertFalse(scheduler.schedule(4, retryDone::countDown));
+            release.countDown();
+            assertTrue(queuedDone.await(5, TimeUnit.SECONDS));
+            assertTrue(scheduler.schedule(4, retryDone::countDown));
+            assertTrue(retryDone.await(5, TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            scheduler.close();
+        }
     }
 }

@@ -5,16 +5,29 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.UUID;
 import java.util.zip.CRC32C;
 
 public record IngotWorldManifest(UUID worldId) {
     public static final String FILE_NAME = "ingot-manifest";
+    private static final String IMPLEMENTATION_VERSION = readImplementationVersion();
+
+    private static String readImplementationVersion() {
+        try (var input = IngotWorldManifest.class.getResourceAsStream("/ingot-version.properties")) {
+            if (input == null) throw new IllegalStateException("Missing generated Ingot version metadata");
+            var properties = new java.util.Properties();
+            properties.load(input);
+            String version = properties.getProperty("implementationVersion");
+            if (version == null || version.isBlank() || version.contains("${")) throw new IllegalStateException("Invalid generated Ingot version metadata");
+            return version;
+        } catch (IOException e) { throw new ExceptionInInitializerError(e); }
+    }
+
     private String body() {
-        return "format=ingot-region\nformatVersion=1\nimplementationVersion=0.2.0-alpha\n"
+        return "format=ingot-region\nformatVersion=1\nimplementationVersion=" + IMPLEMENTATION_VERSION + "\n"
                 + "storageMode=authoritative\nminecraft=1.21.1\nregionWidth=32\ncodec=1\nworldId=" + worldId + "\n";
     }
 
@@ -22,13 +35,17 @@ public record IngotWorldManifest(UUID worldId) {
         String body = body();
         byte[] data = (body + "crc32c=" + checksum(body) + "\n").getBytes(StandardCharsets.UTF_8);
         Path temporary = world.resolve(FILE_NAME + ".pending");
+        Path target = world.resolve(FILE_NAME);
+        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Refusing to overwrite existing Ingot manifest: " + target);
         // Never overwrite a pending activation
         try (FileChannel output = FileChannel.open(temporary, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
             ByteBuffer bytes = ByteBuffer.wrap(data);
             while (bytes.hasRemaining()) output.write(bytes);
             output.force(true);
         }
-        Files.move(temporary, world.resolve(FILE_NAME), StandardCopyOption.ATOMIC_MOVE);
+        // Creating a hard link publishes the complete
+        Files.createLink(target, temporary);
+        Files.delete(temporary);
         if (!read(world).equals(this)) throw new IOException("Manifest publication verification failed");
     }
 

@@ -65,29 +65,80 @@ public final class IngotWorldManager {
             throw new IOException("Interrupted Ingot activation; inspect ingot-manifest.pending in " + root);
         }
         if (marked) IngotWorldManifest.read(root);
-        boolean[] data = {false, false, false}; // anvil system, ingot system, linked path
-        Files.walkFileTree(root, new SimpleFileVisitor<>() {
-            @Override public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-                return FileVisitResult.CONTINUE;
-            }
-            @Override public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                String name = file.getFileName().toString();
-                if (attrs.isSymbolicLink()) data[2] = true;
-                if (name.endsWith(".mca") || name.endsWith(".mcc")) data[0] = true;
-                if (name.endsWith(".ir") || name.contains(".ir.uncommitted-")) data[1] = true;
-                return FileVisitResult.CONTINUE;
-            }
-        });
+        boolean[] data = {false, false, false}; // active Anvil, active Ingot, unsafe active path
+        if (Files.isSymbolicLink(root.resolve("dimensions"))) data[2] = true;
+        try (var children = Files.list(root)) {
+            if (children.anyMatch(p -> isLegacyDimensionName(p.getFileName().toString()) && Files.isSymbolicLink(p))) data[2] = true;
+        }
+        for (Path storageDirectory : storageDirectories(root, data)) {
+            Path realStorage = storageDirectory.toRealPath();
+            if (!realStorage.startsWith(root)) { data[2] = true; continue; }
+            Files.walkFileTree(storageDirectory, new SimpleFileVisitor<>() {
+                @Override public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    if (!dir.equals(storageDirectory) && attrs.isSymbolicLink()) { data[2] = true; return FileVisitResult.SKIP_SUBTREE; }
+                    return FileVisitResult.CONTINUE;
+                }
+                @Override public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    if (attrs.isSymbolicLink()) { data[2] = true; return FileVisitResult.CONTINUE; }
+                    String name = file.getFileName().toString();
+                    if (name.endsWith(".mca") || name.endsWith(".mcc")) data[0] = true;
+                    if (name.endsWith(".ir") || name.contains(".ir.uncommitted-")) data[1] = true;
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        }
         if (data[1] && !marked) throw new IOException("Ingot data exists without its manifest; refusing Anvil fallback: " + root);
+        if (data[2]) throw new IOException("Linked or aliased active storage path found; resolve it before activation: " + root);
         if (data[0]) {
             if (marked) throw new IOException("Anvil data found; Ingot/Anvil mixed backends refused: " + root);
             return null;
         }
-        if (data[2]) throw new IOException("Linked path found in new Ingot world; resolve it before activation: " + root);
         if (!marked) new IngotWorldManifest(UUID.randomUUID()).write(root);
         Session session = new Session(root, directory.toAbsolutePath().normalize());
         WORLDS.put(root, session);
         return session;
+    }
+
+    private static List<Path> storageDirectories(Path root, boolean[] unsafePath) throws IOException {
+        List<Path> result = new java.util.ArrayList<>();
+        addStorageDirectories(root, result);
+        Path dimensions = root.resolve("dimensions");
+        if (Files.isDirectory(dimensions, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(dimensions)) {
+            Files.walkFileTree(dimensions, new SimpleFileVisitor<>() {
+                @Override public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    if (attrs.isSymbolicLink()) {
+                        if (dir.getNameCount() >= dimensions.getNameCount() + 2) unsafePath[2] = true;
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    if (dir.getFileName() != null && isStorageName(dir.getFileName().toString())) {
+                        result.add(dir);
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        }
+        try (var children = Files.list(root)) {
+            for (Path child : children.filter(p -> isLegacyDimensionName(p.getFileName().toString())).toList()) {
+                if (Files.isDirectory(child, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(child)) addStorageDirectories(child, result);
+            }
+        }
+        return result;
+    }
+
+    private static void addStorageDirectories(Path dimensionRoot, List<Path> result) throws IOException {
+        for (String name : List.of("region", "entities", "poi")) {
+            Path candidate = dimensionRoot.resolve(name);
+            if (Files.isDirectory(candidate, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(candidate)) result.add(candidate);
+        }
+    }
+
+    private static boolean isStorageName(String name) {
+        return name.equals("region") || name.equals("entities") || name.equals("poi");
+    }
+
+    private static boolean isLegacyDimensionName(String name) {
+        return name.equals("DIM-1") || name.equals("DIM1");
     }
 
     public static synchronized Session forFolder(Path folder) throws IOException {

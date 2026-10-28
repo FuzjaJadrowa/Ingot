@@ -32,6 +32,7 @@ public final class IngotStorage implements AutoCloseable {
     private final Consumer<Throwable> compactionErrorReporter;
     private final BoundedCompactionScheduler compactionScheduler;
     private final Map<Long, RegionHandle> regions = new LinkedHashMap<>(16, 0.75f, true);
+    private final java.util.Set<Long> openingRegions = new java.util.HashSet<>();
     private final ReentrantLock cacheLock = new ReentrantLock();
     private final Condition stateChanged = cacheLock.newCondition();
     private boolean barrier;
@@ -54,6 +55,8 @@ public final class IngotStorage implements AutoCloseable {
     }
 
     private RegionHandle acquire(int x, int z, boolean create) throws IOException {
+        long openingKey = Long.MIN_VALUE;
+        boolean reservedOpen = false;
         cacheLock.lock();
         try {
             while (barrier) awaitStateChange();
@@ -65,16 +68,39 @@ public final class IngotStorage implements AutoCloseable {
             RegionHandle handle = regions.get(key);
             if (handle == null) {
                 Path path = directory.resolve("r." + rx + "." + rz + ".ir");
-                List<Path> candidates = compactionCandidates(path);
+                while (openingRegions.contains(key)) {
+                    awaitStateChange();
+                    if (closed) throw new IOException("Storage closed: " + directory);
+                    handle = regions.get(key);
+                    if (handle != null) break;
+                }
+                List<Path> candidates = List.of();
+                if (handle == null) {
+                    openingRegions.add(key);
+                    openingKey = key;
+                    reservedOpen = true;
+                    cacheLock.unlock();
+                    try { candidates = compactionCandidates(path); }
+                    finally {
+                        cacheLock.lock();
+                    }
+                    if (closed) throw new IOException("Storage closed: " + directory);
+                    handle = regions.get(key);
+                }
+                if (handle == null) {
                 if (Files.notExists(path)) {
                     if (!candidates.isEmpty()) {
                         throw new IOException("Compaction recovery required for " + path
                                 + "; active region is missing and candidate files were preserved: " + candidates);
                     }
-                    if (!create) return null;
+                    if (!create) {
+                        openingRegions.remove(openingKey);
+                        reservedOpen = false;
+                        stateChanged.signalAll();
+                        return null;
+                    }
                 }
                 while (regions.size() >= options.cachedRegions()) {
-                    while (barrier) awaitStateChange();
                     if (closed) throw new IOException("Storage closed: " + directory);
                     Map.Entry<Long, RegionHandle> evicted = evictIdleRegion();
                     if (evicted == null) {
@@ -84,7 +110,6 @@ public final class IngotStorage implements AutoCloseable {
                         evicted.getValue().file.close();
                     }
                 }
-                while (barrier) awaitStateChange();
                 if (closed) throw new IOException("Storage closed: " + directory);
                 handle = regions.get(key);
                 if (handle == null) {
@@ -95,11 +120,19 @@ public final class IngotStorage implements AutoCloseable {
                     if (file.recoveredTail() != null) recoveryReporter.accept(file.recoveredTail());
                     discardOrphanCandidates(path, candidates);
                 }
+                openingRegions.remove(openingKey);
+                reservedOpen = false;
+                stateChanged.signalAll();
+                }
             }
             handle.activeOperations++;
             activeOperations++;
             return handle;
         } finally {
+            if (reservedOpen) {
+                openingRegions.remove(openingKey);
+                stateChanged.signalAll();
+            }
             cacheLock.unlock();
         }
     }
@@ -225,7 +258,7 @@ public final class IngotStorage implements AutoCloseable {
             if (closed) throw new IOException("Storage closed: " + directory);
             barrier = true;
             ownsBarrier = true;
-            while (activeOperations != 0) awaitStateChange();
+            while (activeOperations != 0 || !openingRegions.isEmpty()) awaitStateChange();
             files = regions.values().stream().map(handle -> handle.file).toList();
         } catch (IOException e) {
             if (ownsBarrier) {
@@ -264,7 +297,7 @@ public final class IngotStorage implements AutoCloseable {
             closed = true;
             barrier = true;
             boolean interrupted = false;
-            while (activeOperations != 0) {
+            while (activeOperations != 0 || !openingRegions.isEmpty()) {
                 try { stateChanged.await(); }
                 catch (InterruptedException e) { interrupted = true; }
             }

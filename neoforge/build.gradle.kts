@@ -61,5 +61,5 @@ tasks.jar {
 tasks.withType<ProcessResources>().configureEach {
     val metadata = mapOf("mod_version" to modVersion)
     inputs.properties(metadata)
-    filesMatching("META-INF/neoforge.mods.toml") { expand(metadata) }
+    filesMatching(listOf("META-INF/neoforge.mods.toml", "ingot-version.properties")) { expand(metadata) }
 }

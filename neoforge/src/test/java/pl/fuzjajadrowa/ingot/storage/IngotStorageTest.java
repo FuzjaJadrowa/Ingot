@@ -20,6 +20,18 @@ import static org.junit.Assert.*;
 public class IngotStorageTest {
     @Rule public final TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void rejectsIoAfterCloseAndReleasesRegionForReopen() throws Exception {
+        Path directory = temporary.getRoot().toPath().resolve("closed");
+        IngotStorage storage = new IngotStorage(directory, StorageOptions.defaults(false), CompressionRegistry.defaults(), ignored -> { });
+        storage.write(0, 0, new byte[] {7});
+        storage.close();
+        try { storage.read(0, 0); fail("Closed storage must reject reads"); }
+        catch (IOException expected) { assertTrue(expected.getMessage().contains("closed")); }
+        try (IngotStorage reopened = new IngotStorage(directory, StorageOptions.defaults(false), CompressionRegistry.defaults(), ignored -> { })) {
+            assertArrayEquals(new byte[] {7}, reopened.read(0, 0));
+        }
+    }
+
     @Test public void evictsAndReopensCachedRegionsWithoutLosingWrites() throws Exception {
         Path directory = temporary.getRoot().toPath().resolve("ingot");
         StorageOptions options = new StorageOptions(1024, 1024, 1, false);

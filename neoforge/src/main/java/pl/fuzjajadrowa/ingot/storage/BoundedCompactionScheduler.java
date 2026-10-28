@@ -1,6 +1,9 @@
 package pl.fuzjajadrowa.ingot.storage;
 
 import java.util.Set;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -13,8 +16,12 @@ final class BoundedCompactionScheduler implements AutoCloseable {
     private static final int QUEUE_CAPACITY = 2;
 
     private final Set<Long> pendingRegions = ConcurrentHashMap.newKeySet();
+    private final Set<Long> runningRegions = new HashSet<>();
+    private final Set<Long> rescheduleRegions = new HashSet<>();
+    private final Map<Long, Runnable> pendingTasks = new HashMap<>();
     private final Consumer<Throwable> errorReporter;
     private final ThreadPoolExecutor executor;
+    private boolean closing;
     private boolean closed;
 
     BoundedCompactionScheduler(Consumer<Throwable> errorReporter) {
@@ -28,9 +35,23 @@ final class BoundedCompactionScheduler implements AutoCloseable {
     }
 
     synchronized boolean schedule(long regionKey, Runnable task) {
-        if (closed || !pendingRegions.add(regionKey)) return false;
+        if (closing || closed) return false;
+        if (!pendingRegions.add(regionKey)) {
+            // Bound every write into a single process
+            if (runningRegions.contains(regionKey)) rescheduleRegions.add(regionKey);
+            return false;
+        }
+        pendingTasks.put(regionKey, task);
+        if (submit(regionKey, task)) return true;
+        pendingRegions.remove(regionKey);
+        pendingTasks.remove(regionKey);
+        return false;
+    }
+
+    private boolean submit(long regionKey, Runnable task) {
         try {
             executor.execute(() -> {
+                synchronized (BoundedCompactionScheduler.this) { runningRegions.add(regionKey); }
                 try {
                     task.run();
                 } catch (Throwable failure) {
@@ -41,22 +62,49 @@ final class BoundedCompactionScheduler implements AutoCloseable {
                         thread.getUncaughtExceptionHandler().uncaughtException(thread, failure);
                     }
                 } finally {
-                    pendingRegions.remove(regionKey);
+                    synchronized (BoundedCompactionScheduler.this) {
+                        runningRegions.remove(regionKey);
+                        if (!closed && rescheduleRegions.remove(regionKey)) {
+                            Runnable followUp = pendingTasks.get(regionKey);
+                            if (followUp != null && submit(regionKey, followUp)) return;
+                            if (followUp != null) rescheduleRegions.add(regionKey);
+                        }
+                        if (!rescheduleRegions.contains(regionKey)) {
+                            pendingRegions.remove(regionKey);
+                            pendingTasks.remove(regionKey);
+                        }
+                        BoundedCompactionScheduler.this.notifyAll();
+                        drainDeferred();
+                    }
                 }
             });
             return true;
         } catch (RejectedExecutionException saturated) {
-            pendingRegions.remove(regionKey);
             return false;
+        }
+    }
+
+    private void drainDeferred() {
+        if (closed) return;
+        for (Long key : Set.copyOf(rescheduleRegions)) {
+            Runnable task = pendingTasks.get(key);
+            if (task == null) { rescheduleRegions.remove(key); continue; }
+            if (submit(key, task)) rescheduleRegions.remove(key);
+            break;
         }
     }
 
     @Override public void close() {
         synchronized (this) {
-            if (!closed) {
-                closed = true;
-                executor.shutdown();
+            if (!closing) closing = true;
+            boolean interrupted = false;
+            while (!pendingRegions.isEmpty()) {
+                try { wait(); }
+                catch (InterruptedException e) { interrupted = true; }
             }
+            closed = true;
+            executor.shutdown();
+            if (interrupted) Thread.currentThread().interrupt();
         }
         boolean interrupted = false;
         while (true) {
