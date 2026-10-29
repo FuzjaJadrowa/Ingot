@@ -46,6 +46,27 @@ public class IngotStorageTest {
         assertTrue(Files.exists(directory.resolve("r.1.0.ir")));
     }
 
+    @Test public void persistsOverwritesAndNegativeCoordinatesAcrossReopen() throws Exception {
+        Path directory = temporary.getRoot().toPath().resolve("negative-coordinates");
+        try (IngotStorage storage = new IngotStorage(directory, StorageOptions.defaults(false),
+                CompressionRegistry.defaults(), ignored -> { })) {
+            storage.write(-1, -33, new byte[] {1});
+            storage.write(-32, -64, new byte[] {2});
+            storage.write(-1, -33, new byte[] {3, 4});
+            storage.write(0, -33, new byte[] {5});
+            assertArrayEquals(new byte[] {3, 4}, storage.read(-1, -33));
+            assertArrayEquals(new byte[] {2}, storage.read(-32, -64));
+            assertArrayEquals(new byte[] {5}, storage.read(0, -33));
+            storage.flush();
+        }
+        try (IngotStorage reopened = new IngotStorage(directory, StorageOptions.defaults(false),
+                CompressionRegistry.defaults(), ignored -> { })) {
+            assertArrayEquals(new byte[] {3, 4}, reopened.read(-1, -33));
+            assertArrayEquals(new byte[] {2}, reopened.read(-32, -64));
+            assertArrayEquals(new byte[] {5}, reopened.read(0, -33));
+        }
+    }
+
     @Test public void permitsConcurrentOperationsAcrossRegionsAndChunks() throws Exception {
         Path directory = temporary.getRoot().toPath().resolve("ingot");
         StorageOptions options = new StorageOptions(4096, 4096, 4, false);
@@ -115,6 +136,46 @@ public class IngotStorageTest {
         } finally {
             executor.shutdownNow();
             storage.close();
+        }
+    }
+
+    @Test public void concurrentCompactionAndWritesPreserveCommittedPayloads() throws Exception {
+        Path directory = temporary.getRoot().toPath().resolve("concurrent-compaction");
+        IngotStorage storage = new IngotStorage(directory, StorageOptions.defaults(false),
+                CompressionRegistry.defaults(), ignored -> { });
+        storage.write(0, 0, new byte[] {0, 11});
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CountDownLatch start = new CountDownLatch(1);
+        try {
+            Future<?> compaction = executor.submit(() -> {
+                start.await();
+                storage.compactRegion(0, 0);
+                return null;
+            });
+            Future<?> writes = executor.submit(() -> {
+                start.await();
+                for (int x = 0; x < 24; x++) storage.write(x, 0, new byte[] {(byte) x, 11});
+                for (int value = 0; value < 100; value++) {
+                    storage.write(31, 31, new byte[] {(byte) value, (byte) (value >>> 1)});
+                }
+                return null;
+            });
+            start.countDown();
+            compaction.get();
+            writes.get();
+
+            for (int x = 0; x < 24; x++) assertArrayEquals(new byte[] {(byte) x, 11}, storage.read(x, 0));
+            assertArrayEquals(new byte[] {99, 49}, storage.read(31, 31));
+            storage.flush();
+        } finally {
+            executor.shutdownNow();
+            storage.close();
+        }
+
+        try (IngotStorage reopened = new IngotStorage(directory, StorageOptions.defaults(false),
+                CompressionRegistry.defaults(), ignored -> { })) {
+            for (int x = 0; x < 24; x++) assertArrayEquals(new byte[] {(byte) x, 11}, reopened.read(x, 0));
+            assertArrayEquals(new byte[] {99, 49}, reopened.read(31, 31));
         }
     }
 

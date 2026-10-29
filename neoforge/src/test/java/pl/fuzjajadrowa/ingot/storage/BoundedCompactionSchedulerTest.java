@@ -30,7 +30,7 @@ public class BoundedCompactionSchedulerTest {
             release.countDown();
             scheduler.close();
         }
-        assertEquals(4, completed.get());
+        assertEquals("one duplicate write while a region is running should produce one follow-up", 5, completed.get());
         assertFalse(scheduler.schedule(5, completed::incrementAndGet));
     }
 
@@ -73,7 +73,7 @@ public class BoundedCompactionSchedulerTest {
         } finally { scheduler.close(); }
     }
 
-    @Test public void rejectedRegionCanBeRetriedAfterQueueSpaceOpens() throws Exception {
+    @Test public void rejectedRegionIsRetriedWhenQueueSpaceOpensWithoutGrowingTheExecutorQueue() throws Exception {
         CountDownLatch running = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         CountDownLatch queuedDone = new CountDownLatch(2);
@@ -91,8 +91,7 @@ public class BoundedCompactionSchedulerTest {
             assertFalse(scheduler.schedule(4, retryDone::countDown));
             release.countDown();
             assertTrue(queuedDone.await(5, TimeUnit.SECONDS));
-            assertTrue(scheduler.schedule(4, retryDone::countDown));
-            assertTrue(retryDone.await(5, TimeUnit.SECONDS));
+            assertTrue("deferred task should run without another write", retryDone.await(5, TimeUnit.SECONDS));
         } finally {
             release.countDown();
             scheduler.close();

@@ -1,23 +1,25 @@
 package pl.fuzjajadrowa.ingot.storage;
 
-import java.util.Set;
-import java.util.Map;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
 final class BoundedCompactionScheduler implements AutoCloseable {
     private static final int WORKER_COUNT = 1;
     private static final int QUEUE_CAPACITY = 2;
+    private static final int DEFERRED_CAPACITY = 128;
 
-    private final Set<Long> pendingRegions = ConcurrentHashMap.newKeySet();
+    private final Set<Long> pendingRegions = new HashSet<>();
     private final Set<Long> runningRegions = new HashSet<>();
     private final Set<Long> rescheduleRegions = new HashSet<>();
+    private final LinkedHashSet<Long> deferredRegions = new LinkedHashSet<>();
     private final Map<Long, Runnable> pendingTasks = new HashMap<>();
     private final Consumer<Throwable> errorReporter;
     private final ThreadPoolExecutor executor;
@@ -37,45 +39,44 @@ final class BoundedCompactionScheduler implements AutoCloseable {
     synchronized boolean schedule(long regionKey, Runnable task) {
         if (closing || closed) return false;
         if (!pendingRegions.add(regionKey)) {
-            // Bound every write into a single process
             if (runningRegions.contains(regionKey)) rescheduleRegions.add(regionKey);
             return false;
         }
+
         pendingTasks.put(regionKey, task);
         if (submit(regionKey, task)) return true;
+        if (defer(regionKey)) return false;
         pendingRegions.remove(regionKey);
         pendingTasks.remove(regionKey);
+        notifyAll();
         return false;
+    }
+
+    private boolean defer(long regionKey) {
+        if (deferredRegions.contains(regionKey)) return true;
+        if (deferredRegions.size() >= DEFERRED_CAPACITY) return false;
+        deferredRegions.add(regionKey);
+        return true;
     }
 
     private boolean submit(long regionKey, Runnable task) {
         try {
             executor.execute(() -> {
-                synchronized (BoundedCompactionScheduler.this) { runningRegions.add(regionKey); }
+                synchronized (BoundedCompactionScheduler.this) {
+                    runningRegions.add(regionKey);
+                }
                 try {
                     task.run();
                 } catch (Throwable failure) {
-                    try { errorReporter.accept(failure); }
-                    catch (Throwable reportingFailure) {
+                    try {
+                        errorReporter.accept(failure);
+                    } catch (Throwable reportingFailure) {
                         if (reportingFailure != failure) failure.addSuppressed(reportingFailure);
                         Thread thread = Thread.currentThread();
                         thread.getUncaughtExceptionHandler().uncaughtException(thread, failure);
                     }
                 } finally {
-                    synchronized (BoundedCompactionScheduler.this) {
-                        runningRegions.remove(regionKey);
-                        if (!closed && rescheduleRegions.remove(regionKey)) {
-                            Runnable followUp = pendingTasks.get(regionKey);
-                            if (followUp != null && submit(regionKey, followUp)) return;
-                            if (followUp != null) rescheduleRegions.add(regionKey);
-                        }
-                        if (!rescheduleRegions.contains(regionKey)) {
-                            pendingRegions.remove(regionKey);
-                            pendingTasks.remove(regionKey);
-                        }
-                        BoundedCompactionScheduler.this.notifyAll();
-                        drainDeferred();
-                    }
+                    finishTask(regionKey);
                 }
             });
             return true;
@@ -84,19 +85,51 @@ final class BoundedCompactionScheduler implements AutoCloseable {
         }
     }
 
+    private void finishTask(long regionKey) {
+        synchronized (this) {
+            runningRegions.remove(regionKey);
+            boolean followUpSubmitted = false;
+            boolean followUpRequested = rescheduleRegions.remove(regionKey);
+            if (!closed && followUpRequested) {
+                Runnable followUp = pendingTasks.get(regionKey);
+                if (followUp != null) {
+                    followUpSubmitted = submit(regionKey, followUp);
+                    if (!followUpSubmitted && !defer(regionKey)) {
+                        pendingRegions.remove(regionKey);
+                        pendingTasks.remove(regionKey);
+                    }
+                }
+            }
+
+            if (!followUpSubmitted && !deferredRegions.contains(regionKey)) {
+                rescheduleRegions.remove(regionKey);
+                pendingRegions.remove(regionKey);
+                pendingTasks.remove(regionKey);
+            }
+            notifyAll();
+            drainDeferred();
+        }
+    }
+
     private void drainDeferred() {
-        if (closed) return;
-        for (Long key : Set.copyOf(rescheduleRegions)) {
+        if (closed || deferredRegions.isEmpty()) return;
+        var iterator = deferredRegions.iterator();
+        while (iterator.hasNext()) {
+            Long key = iterator.next();
             Runnable task = pendingTasks.get(key);
-            if (task == null) { rescheduleRegions.remove(key); continue; }
-            if (submit(key, task)) rescheduleRegions.remove(key);
+            if (task == null) {
+                iterator.remove();
+                pendingRegions.remove(key);
+                continue;
+            }
+            if (submit(key, task)) iterator.remove();
             break;
         }
     }
 
     @Override public void close() {
         synchronized (this) {
-            if (!closing) closing = true;
+            closing = true;
             boolean interrupted = false;
             while (!pendingRegions.isEmpty()) {
                 try { wait(); }
