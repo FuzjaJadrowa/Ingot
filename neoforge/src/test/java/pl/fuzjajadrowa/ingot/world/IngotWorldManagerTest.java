@@ -11,6 +11,11 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.*;
 
@@ -253,5 +258,60 @@ public class IngotWorldManagerTest {
         } catch (IOException expected) {
             assertTrue(expected.getMessage().contains("checksum"));
         }
+    }
+
+    @Test public void concurrentOpenOfSameWorldRegistersOnlyOneSession() throws Exception {
+        Path root = world("concurrent-open");
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        IngotWorldManager.Session[] winner = new IngotWorldManager.Session[1];
+        try {
+            Future<Boolean> first = executor.submit(() -> {
+                start.await();
+                try { winner[0] = IngotWorldManager.openWorld(root); return true; }
+                catch (IOException expected) { return false; }
+            });
+            Future<Boolean> second = executor.submit(() -> {
+                start.await();
+                try {
+                    IngotWorldManager.Session session = IngotWorldManager.openWorld(root);
+                    synchronized (winner) { winner[0] = session; }
+                    return true;
+                } catch (IOException expected) { return false; }
+            });
+            start.countDown();
+            boolean a = first.get(10, TimeUnit.SECONDS), b = second.get(10, TimeUnit.SECONDS);
+            assertTrue("exactly one open should succeed", a ^ b);
+            assertNotNull(winner[0]);
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            IngotWorldManager.closeWorld(winner[0]);
+        }
+    }
+
+    @Test public void oneCorruptRegionAmongMultipleDimensionsFailsWithoutChangingOtherData() throws Exception {
+        Path root = world("multi-region-corrupt");
+        Path valid = root.resolve("region/ingot/r.0.0.ir");
+        Path corrupt = root.resolve("dimensions/example/test/region/ingot/r.1.0.ir");
+        Files.createDirectories(valid.getParent());
+        Files.createDirectories(corrupt.getParent());
+        try (var region = new pl.fuzjajadrowa.ingot.storage.IngotRegionFile(valid, 0, 0,
+                StorageOptions.defaults(false), CompressionRegistry.defaults())) { region.write(0, 0, new byte[] {3, 4}); }
+        Files.write(corrupt, new byte[] {1, 2, 3});
+        new IngotWorldManifest(UUID.randomUUID()).write(root);
+        IngotWorldManager.Session session = IngotWorldManager.openWorld(root);
+        assertNotNull(session);
+        IngotStorage primary = new IngotStorage(valid.getParent(), StorageOptions.defaults(false), CompressionRegistry.defaults(), ignored -> { });
+        IngotStorage modded = new IngotStorage(corrupt.getParent(), StorageOptions.defaults(false), CompressionRegistry.defaults(), ignored -> { });
+        session.register(primary);
+        session.register(modded);
+        try {
+            assertArrayEquals(new byte[] {3, 4}, primary.read(0, 0));
+            try { modded.read(32, 0); fail("Corrupt region in secondary dimension must fail explicitly"); }
+            catch (IOException expected) { assertTrue(Files.exists(corrupt)); }
+            assertTrue(Files.exists(valid));
+            assertFalse(Files.exists(root.resolve("dimensions/example/test/region/r.1.0.mca")));
+        } finally { IngotWorldManager.closeWorld(session); }
     }
 }

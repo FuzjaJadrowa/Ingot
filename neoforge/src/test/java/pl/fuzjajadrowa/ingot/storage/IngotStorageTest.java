@@ -235,6 +235,25 @@ public class IngotStorageTest {
         assertFalse(Files.exists(directory.resolve("r.0.0.ir")));
     }
 
+    @Test public void missingActiveRegionDoesNotTrustEvenAValidCompactionCandidate() throws Exception {
+        Path directory = temporary.getRoot().toPath().resolve("valid-orphan-candidate");
+        Files.createDirectories(directory);
+        Path active = directory.resolve("r.0.0.ir");
+        Path candidate = directory.resolve("r.0.0.ir.compacting-verified-looking");
+        try (IngotRegionFile region = new IngotRegionFile(active, 0, 0,
+                new StorageOptions(1024, 1024, 2, false), CompressionRegistry.defaults())) {
+            region.write(0, 0, new byte[] {7, 8, 9});
+        }
+        Files.copy(active, candidate);
+        Files.delete(active);
+        try (IngotStorage storage = new IngotStorage(directory,
+                new StorageOptions(1024, 1024, 2, false), CompressionRegistry.defaults(), ignored -> { })) {
+            try { storage.read(0, 0); fail("An uncommitted publication must not be guessed from a valid candidate"); }
+            catch (IOException expected) { assertTrue(expected.getMessage().contains("recovery required")); }
+        }
+        assertTrue("Candidate must be preserved for manual recovery", Files.exists(candidate));
+    }
+
     @Test public void damagedActiveRegionPreservesCandidateForInvestigation() throws Exception {
         Path directory = temporary.getRoot().toPath().resolve("ingot");
         Files.createDirectories(directory);

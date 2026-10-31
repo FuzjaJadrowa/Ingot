@@ -32,6 +32,7 @@ public final class IngotRegionFile implements AutoCloseable {
     private final int regionZ;
     private final StorageOptions options;
     private final CompressionRegistry codecs;
+    private final RegionFaultInjector faultInjector;
     private FileChannel channel;
     private FileLock lock;
     private final FileChannel stableLockChannel;
@@ -49,11 +50,17 @@ public final class IngotRegionFile implements AutoCloseable {
 
     public IngotRegionFile(Path path, int regionX, int regionZ, StorageOptions options,
                            CompressionRegistry codecs) throws IOException {
+        this(path, regionX, regionZ, options, codecs, RegionFaultInjector.NONE);
+    }
+
+    IngotRegionFile(Path path, int regionX, int regionZ, StorageOptions options,
+                    CompressionRegistry codecs, RegionFaultInjector faultInjector) throws IOException {
         this.path = path;
         this.regionX = regionX;
         this.regionZ = regionZ;
         this.options = options;
         this.codecs = codecs;
+        this.faultInjector = faultInjector;
         FileChannel stableChannel = null;
         FileLock acquiredStableLock = null;
         FileChannel opened = null;
@@ -272,6 +279,7 @@ public final class IngotRegionFile implements AutoCloseable {
                 writeFully(output, ByteBuffer.wrap(compressed), outputEnd + RECORD_HEADER_SIZE);
                 writeFully(output, commit, outputEnd + RECORD_HEADER_SIZE + compressed.length);
                 outputEnd += recordLength;
+                checkpoint(RegionFaultInjector.Point.DURING_CANDIDATE);
 
                 if (!java.util.Arrays.equals(originalPayload, decompress(codec, compressed, rawLength, rawCrc))) {
                     throw corrupt("Payload changed while building compacted candidate");
@@ -279,6 +287,7 @@ public final class IngotRegionFile implements AutoCloseable {
             }
             output.force(true);
         }
+        checkpoint(RegionFaultInjector.Point.AFTER_CANDIDATE);
 
         Path candidateLock = candidate.resolveSibling(candidate.getFileName() + ".lock");
         try {
@@ -295,6 +304,7 @@ public final class IngotRegionFile implements AutoCloseable {
         } finally {
             Files.deleteIfExists(candidateLock);
         }
+        checkpoint(RegionFaultInjector.Point.AFTER_VALIDATION);
     }
 
     synchronized void compactTo(Path candidate) throws IOException {
@@ -318,6 +328,10 @@ public final class IngotRegionFile implements AutoCloseable {
         IOException closeFailure = null;
         try { oldLock.release(); } catch (IOException e) { closeFailure = e; }
         try { oldChannel.close(); } catch (IOException e) { closeFailure = collect(closeFailure, e); }
+        if (closeFailure == null) {
+            try { checkpoint(RegionFaultInjector.Point.AFTER_SOURCE_CLOSE); }
+            catch (IOException e) { closeFailure = e; }
+        }
         if (closeFailure != null) {
             try { reopenCurrentFile(); } catch (IOException e) {
                 closeFailure.addSuppressed(e);
@@ -328,6 +342,7 @@ public final class IngotRegionFile implements AutoCloseable {
 
         try {
             publisher.publish(candidate, path);
+            checkpoint(RegionFaultInjector.Point.AFTER_PUBLISH);
         } catch (IOException moveFailure) {
             try { reopenCurrentFile(); } catch (IOException e) {
                 moveFailure.addSuppressed(e);
@@ -444,12 +459,17 @@ public final class IngotRegionFile implements AutoCloseable {
             dirty = true;
             h.flip();
             writeFully(h, end);
+            checkpoint(RegionFaultInjector.Point.AFTER_HEADER);
             writeFully(ByteBuffer.wrap(compressed), end + RECORD_HEADER_SIZE);
+            checkpoint(RegionFaultInjector.Point.AFTER_PAYLOAD);
             if (options.sync()) channel.force(false);
+            if (options.sync()) checkpoint(RegionFaultInjector.Point.AFTER_DATA_FORCE);
             writeFully(commit, end + RECORD_HEADER_SIZE + compressed.length);
+            checkpoint(RegionFaultInjector.Point.AFTER_COMMIT);
             if (options.sync()) {
                 channel.force(true);
                 dirty = false;
+                checkpoint(RegionFaultInjector.Point.AFTER_COMMIT_FORCE);
             }
             index[slot] = type == 2 ? null : entry(h, end);
             generation++;
@@ -472,7 +492,10 @@ public final class IngotRegionFile implements AutoCloseable {
     @Override public synchronized void close() throws IOException {
         if (closed) return;
         closed = true;
-        IOException failure = writeFailure;
+        // Use a distinct exception object: try-with-resources may need to suppress
+        // close failures onto the IOException already thrown by append().
+        IOException failure = writeFailure == null ? null
+                : new IOException("Region had an earlier write failure: " + path, writeFailure);
         if (channel != null && (dirty || writeFailure != null)) {
             try {
                 channel.force(true);
@@ -500,6 +523,9 @@ public final class IngotRegionFile implements AutoCloseable {
     private void checkOpen() throws IOException {
         if (closed) throw new IOException("Region closed: " + path);
         if (writeFailure != null) throw new IOException("Region poisoned by an earlier write failure: " + path, writeFailure);
+    }
+    private void checkpoint(RegionFaultInjector.Point point) throws IOException {
+        if (faultInjector != RegionFaultInjector.NONE) faultInjector.checkpoint(point);
     }
     private CorruptRegionException corrupt(String message) { return new CorruptRegionException(message + ": " + path); }
     private static int crc(byte[] data, int start, int length) {

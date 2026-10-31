@@ -161,6 +161,19 @@ public class IngotRegionFileTest {
         }
     }
 
+    @Test public void enforcesCompressedPayloadLimitWithoutAppending() throws Exception {
+        Path path = regionPath("compressed-limit.ir");
+        StorageOptions compressedLimit = new StorageOptions(4096, 32, 2, false);
+        byte[] incompressible = new byte[1024];
+        new Random(9127).nextBytes(incompressible);
+        try (IngotRegionFile region = new IngotRegionFile(path, 0, 0, compressedLimit, codecs)) {
+            try { region.write(0, 0, incompressible); fail("Compressed payload beyond the configured cap must be rejected"); }
+            catch (IOException expected) { assertTrue(expected.getMessage().contains("compressed byte limit")); }
+            assertNull(region.read(0, 0));
+            assertEquals(0, region.statistics().committedRecords());
+        }
+    }
+
     @Test public void reportsCorruptCommittedPayload() throws Exception {
         Path path = regionPath("r.0.0.ir");
         try (IngotRegionFile region = open(path, 0, 0)) { region.write(0, 0, new byte[200]); }
@@ -202,6 +215,78 @@ public class IngotRegionFileTest {
             assertTrue(Files.exists(reopened.recoveredTail()));
             assertEquals(committedSize, Files.size(path));
         }
+    }
+
+    @Test public void recoversEveryIncompleteRecordPrefix() throws Exception {
+        Path source = regionPath("prefix-source.ir");
+        byte[] committed = {7, 1, 9};
+        byte[] pending = new byte[96];
+        new Random(9981).nextBytes(pending);
+        long committedEnd;
+        long completeSize;
+        try (IngotRegionFile region = open(source, 0, 0)) {
+            region.write(0, 0, committed);
+            committedEnd = Files.size(source);
+            region.write(1, 0, pending);
+            completeSize = Files.size(source);
+        }
+        byte[] complete = Files.readAllBytes(source);
+        int prefixLength = Math.toIntExact(completeSize - committedEnd);
+        assertTrue("fixture must include header, payload and commit", prefixLength > 48 + 24);
+
+        for (int cut = 1; cut < prefixLength; cut++) {
+            Path directory = temporary.newFolder("cut-" + cut).toPath();
+            Path copy = directory.resolve("r.0.0.ir");
+            Files.write(copy, java.util.Arrays.copyOf(complete, Math.toIntExact(committedEnd) + cut));
+            Path recovered;
+            try (IngotRegionFile region = open(copy, 0, 0)) {
+                assertArrayEquals("seed=9981 cut=" + cut, committed, region.read(0, 0));
+                assertNull("seed=9981 cut=" + cut, region.read(1, 0));
+                recovered = region.recoveredTail();
+                assertNotNull("seed=9981 cut=" + cut, recovered);
+                assertEquals(cut, Files.size(recovered));
+                assertEquals(committedEnd, Files.size(copy));
+            }
+            try (IngotRegionFile reopened = open(copy, 0, 0)) {
+                assertArrayEquals(committed, reopened.read(0, 0));
+                assertNull(reopened.read(1, 0));
+                assertNull("Already recovered region should reopen cleanly", reopened.recoveredTail());
+            }
+            assertTrue("Recovery evidence must remain available", Files.exists(recovered));
+        }
+    }
+
+    @Test public void repeatedRecoveryPreservesEarlierAndLaterTailsSeparately() throws Exception {
+        Path path = regionPath("repeated-recovery.ir");
+        try (IngotRegionFile region = open(path, 0, 0)) { region.write(0, 0, new byte[] {6}); }
+        Files.write(path, new byte[] {1, 2, 3}, StandardOpenOption.APPEND);
+        Path firstTail;
+        try (IngotRegionFile recovered = open(path, 0, 0)) {
+            firstTail = recovered.recoveredTail();
+            assertNotNull(firstTail);
+        }
+        Files.write(path, new byte[] {4, 5}, StandardOpenOption.APPEND);
+        try (IngotRegionFile recoveredAgain = open(path, 0, 0)) {
+            assertNotNull(recoveredAgain.recoveredTail());
+            assertNotEquals(firstTail, recoveredAgain.recoveredTail());
+            assertArrayEquals(new byte[] {6}, recoveredAgain.read(0, 0));
+        }
+        assertArrayEquals(new byte[] {1, 2, 3}, Files.readAllBytes(firstTail));
+    }
+
+    @Test public void committedRecordCorruptionIsNeverTreatedAsRecoverableTail() throws Exception {
+        Path path = regionPath("committed-corruption.ir");
+        try (IngotRegionFile region = open(path, 0, 0)) { region.write(0, 0, new byte[] {1, 2, 3}); }
+        byte[] bytes = Files.readAllBytes(path);
+        bytes[IngotRegionFile.HEADER_SIZE + 8] ^= 1; // committed chunk coordinate, invalidating header checksum
+        Files.write(path, bytes);
+        try {
+            open(path, 0, 0).close();
+            fail("Corrupt committed record must fail loudly");
+        } catch (CorruptRegionException expected) {
+            assertTrue(expected.getMessage().contains("Invalid record header"));
+        }
+        assertEquals("Damaged committed bytes must not be truncated", bytes.length, Files.size(path));
     }
 
     @Test public void preventsSimultaneousOpenAndReleasesLockOnClose() throws Exception {
@@ -334,6 +419,28 @@ public class IngotRegionFileTest {
 
         try (IngotRegionFile reopened = open(path, 0, 0)) {
             assertArrayEquals(latest, reopened.read(0, 0));
+        }
+    }
+
+    @Test public void compactionCheckpointFailuresReopenTheAuthoritativePath() throws Exception {
+        for (RegionFaultInjector.Point point : new RegionFaultInjector.Point[] {
+                RegionFaultInjector.Point.AFTER_CANDIDATE, RegionFaultInjector.Point.AFTER_VALIDATION,
+                RegionFaultInjector.Point.AFTER_SOURCE_CLOSE, RegionFaultInjector.Point.AFTER_PUBLISH }) {
+            Path path = regionPath("in-process-compact-" + point + ".ir");
+            Path candidate = path.resolveSibling(path.getFileName() + ".compacting-test");
+            RegionFaultInjector injector = stage -> {
+                if (stage == point) throw new IOException("injected " + stage);
+            };
+            try (IngotRegionFile region = new IngotRegionFile(path, 0, 0, options, codecs, injector)) {
+                region.write(0, 0, new byte[] {1});
+                region.write(0, 0, new byte[] {2, 3});
+                try { region.compactTo(candidate); fail("Expected compaction failure at " + point); }
+                catch (IOException expected) { assertTrue(expected.toString().contains(point.name())); }
+                assertArrayEquals(new byte[] {2, 3}, region.read(0, 0));
+            }
+            try (IngotRegionFile reopened = open(path, 0, 0)) {
+                assertArrayEquals(new byte[] {2, 3}, reopened.read(0, 0));
+            }
         }
     }
 }

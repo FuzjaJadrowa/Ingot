@@ -51,6 +51,29 @@ tasks.test {
     useJUnit()
     testLogging { events("passed", "skipped", "failed") }
     maxHeapSize = "1G"
+    systemProperty("ingot.test.classpath", sourceSets.test.get().runtimeClasspath.asPath)
+}
+
+val benchmarkSourceSet = sourceSets.create("benchmark") {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += output + compileClasspath
+}
+configurations[benchmarkSourceSet.implementationConfigurationName]
+    .extendsFrom(configurations["implementation"])
+tasks.register<JavaExec>("compressionBenchmark") {
+    description = "Runs the payload compression benchmark against a supplied NBT dataset."
+    group = "verification"
+    dependsOn(benchmarkSourceSet.classesTaskName)
+    classpath = benchmarkSourceSet.runtimeClasspath
+    mainClass.set("pl.fuzjajadrowa.ingot.benchmark.CompressionBenchmark")
+    val dataset = providers.gradleProperty("benchmarkData")
+    val report = layout.buildDirectory.dir("reports/ingot-benchmark")
+    doFirst {
+        require(dataset.isPresent) { "Pass -PbenchmarkData=<directory> containing vanilla, block_entities and low_compressibility folders" }
+        args(rootProject.file(dataset.get()).absolutePath, report.get().asFile.absolutePath)
+        systemProperty("ingot.version", project.version.toString())
+        systemProperty("ingot.minecraft", minecraftVersion)
+    }
 }
 tasks.jar {
     manifest.attributes("Implementation-Version" to project.version)
