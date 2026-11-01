@@ -10,6 +10,7 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import pl.fuzjajadrowa.ingot.world.IngotWorldManifest;
+import pl.fuzjajadrowa.ingot.world.WorldStorageDetector;
 
 import java.io.DataOutputStream;
 import java.nio.file.Files;
@@ -17,12 +18,14 @@ import java.nio.file.Path;
 import java.util.UUID;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.fail;
 import static org.junit.Assert.assertTrue;
 
 public class WorldConversionStagerTest {
     @Rule public final TemporaryFolder temporary = new TemporaryFolder();
 
-    @Test public void stagesAndVerifiesAnvilIngotAnvilWithoutPublishing() throws Exception {
+    @Test public void stagesPublishesAndVerifiesAnvilIngotAnvilRoundTrip() throws Exception {
         Path world = temporary.newFolder("roundtrip").toPath();
         Path regionDir = Files.createDirectories(world.resolve("region"));
         RegionStorageInfo info = new RegionStorageInfo("test", Level.OVERWORLD, "chunk");
@@ -40,21 +43,77 @@ public class WorldConversionStagerTest {
         assertTrue(Files.exists(world.resolve("region/r.-1.2.mca")));
         Path ingotRegion = toIngot.stagingDirectory().resolve("region/ingot/r.-1.2.ir");
         assertTrue(Files.exists(ingotRegion));
-
-        Path activeIngot = Files.createDirectories(world.resolve("region/ingot"));
-        Files.copy(ingotRegion, activeIngot.resolve(ingotRegion.getFileName()));
-        Files.delete(world.resolve("region/r.-1.2.mca"));
-        new IngotWorldManifest(UUID.randomUUID()).write(world);
+        WorldConversionStager.PublicationResult firstPublish = WorldConversionStager.publish(world, toIngot, ignored -> { });
+        assertEquals(1L, firstPublish.verifiedRecords());
+        assertTrue(Files.exists(firstPublish.preservedSource().resolve("region/r.-1.2.mca")));
+        assertEquals(WorldStorageDetector.Format.INGOT, WorldStorageDetector.inspect(world).format());
+        assertTrue(Files.exists(world.resolve("region/ingot/r.-1.2.ir")));
 
         WorldConversionStager.Result toAnvil = WorldConversionStager.stage(world,
                 ConversionDirection.INGOT_TO_ANVIL, ignored -> { });
         assertEquals(1L, toAnvil.convertedRecords());
-        Path returnedRegion = toAnvil.stagingDirectory().resolve("region/r.-1.2.mca");
+        WorldConversionStager.PublicationResult secondPublish = WorldConversionStager.publish(world, toAnvil, ignored -> { });
+        assertEquals(1L, secondPublish.verifiedRecords());
+        Path returnedRegion = world.resolve("region/r.-1.2.mca");
         try (RegionFile region = new RegionFile(info, returnedRegion, returnedRegion.getParent(), false);
              var input = region.getChunkDataInputStream(new ChunkPos(-1, 65))) {
             assertEquals(expected, NbtIo.read(input));
         }
-        assertTrue(Files.exists(world.resolve("region/ingot/r.-1.2.ir")));
-        assertTrue(Files.exists(world.resolve(IngotWorldManifest.FILE_NAME)));
+        assertTrue(Files.exists(secondPublish.preservedSource().resolve("region/ingot/r.-1.2.ir")));
+        assertEquals(WorldStorageDetector.Format.ANVIL, WorldStorageDetector.inspect(world).format());
+        assertFalse(Files.exists(world.resolve(IngotWorldManifest.FILE_NAME)));
+    }
+
+    @Test public void failedPublicationRollsBackToOriginalAnvilFiles() throws Exception {
+        Path world = temporary.newFolder("rollback").toPath();
+        Path regionDir = Files.createDirectories(world.resolve("region"));
+        RegionStorageInfo info = new RegionStorageInfo("test", Level.OVERWORLD, "chunk");
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("value", 9);
+        try (RegionFile region = new RegionFile(info, regionDir.resolve("r.0.0.mca"), regionDir, true);
+             DataOutputStream output = region.getChunkDataOutputStream(new ChunkPos(2, 3))) {
+            NbtIo.write(tag, output);
+        }
+        WorldConversionStager.Result staged = WorldConversionStager.stage(world, ConversionDirection.ANVIL_TO_INGOT, ignored -> { });
+        try {
+            WorldConversionStager.publish(world, staged, progress -> {
+                if (progress.stage() == ConversionProgress.Stage.PUBLICATION && progress.completed() == 1) {
+                    throw new IllegalStateException("Injected publication interruption");
+                }
+            });
+            fail("Injected publication error must be reported");
+        } catch (IllegalStateException expected) { }
+        assertEquals(WorldStorageDetector.Format.ANVIL, WorldStorageDetector.inspect(world).format());
+        assertTrue(Files.exists(world.resolve("region/r.0.0.mca")));
+        assertFalse(Files.exists(world.resolve(IngotWorldManifest.FILE_NAME)));
+        assertFalse(Files.exists(world.resolve("ingot-conversion.journal")));
+    }
+
+    @Test public void recoveryRollsBackPublicationInterruptedAfterArchivingSource() throws Exception {
+        Path world = temporary.newFolder("interrupted-publication").toPath();
+        Path regionDir = Files.createDirectories(world.resolve("region"));
+        RegionStorageInfo info = new RegionStorageInfo("test", Level.OVERWORLD, "chunk");
+        CompoundTag tag = new CompoundTag();
+        tag.putString("safe", "original");
+        try (RegionFile region = new RegionFile(info, regionDir.resolve("r.0.0.mca"), regionDir, true);
+             DataOutputStream output = region.getChunkDataOutputStream(new ChunkPos(1, 1))) {
+            NbtIo.write(tag, output);
+        }
+        WorldConversionStager.Result staged = WorldConversionStager.stage(world, ConversionDirection.ANVIL_TO_INGOT, ignored -> { });
+        try {
+            WorldConversionStager.publish(world, staged, progress -> {
+                if (progress.stage() == ConversionProgress.Stage.PUBLICATION && progress.completed() == 1) {
+                    throw new AssertionError("Simulated process termination");
+                }
+            });
+            fail("Simulated interruption must escape the publisher");
+        } catch (AssertionError expected) { }
+        assertTrue(Files.exists(world.resolve(ConversionJournal.FILE_NAME)));
+        assertFalse(Files.exists(world.resolve("region/r.0.0.mca")));
+
+        WorldConversionStager.recover(world);
+        assertEquals(WorldStorageDetector.Format.ANVIL, WorldStorageDetector.inspect(world).format());
+        assertTrue(Files.exists(world.resolve("region/r.0.0.mca")));
+        assertFalse(Files.exists(world.resolve(ConversionJournal.FILE_NAME)));
     }
 }

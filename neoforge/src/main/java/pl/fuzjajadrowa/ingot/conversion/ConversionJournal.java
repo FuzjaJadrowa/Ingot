@@ -77,6 +77,14 @@ public record ConversionJournal(UUID id, ConversionDirection direction, Phase ph
         Files.delete(file);
     }
 
+    public void clearAfterRecovery(Path root) throws IOException {
+        if (phase == Phase.PUBLICATION) throw new IOException("Publication must be rolled back before clearing its journal");
+        Path file = checkedRoot(root).resolve(FILE_NAME);
+        ConversionJournal current = read(root);
+        if (!current.equals(this)) throw new IOException("Conversion journal changed; refusing to clear it: " + file);
+        Files.delete(file);
+    }
+
     private void writeNew(Path target) throws IOException {
         Path temp = target.resolveSibling(TEMP_NAME);
         byte[] bytes = serialize().getBytes(StandardCharsets.UTF_8);
@@ -140,8 +148,8 @@ public record ConversionJournal(UUID id, ConversionDirection direction, Phase ph
             case PREFLIGHT -> to == Phase.STAGING || to == Phase.FAILED;
             case STAGING -> to == Phase.VERIFICATION || to == Phase.FAILED;
             case VERIFICATION -> to == Phase.STAGED || to == Phase.PUBLICATION || to == Phase.FAILED;
-            case STAGED -> false;
-            case PUBLICATION -> to == Phase.COMPLETE || to == Phase.FAILED;
+            case STAGED -> to == Phase.PUBLICATION;
+            case PUBLICATION -> to == Phase.PUBLICATION || to == Phase.COMPLETE || to == Phase.FAILED;
             case COMPLETE, FAILED -> false;
         };
     }

@@ -13,6 +13,9 @@ import net.minecraft.world.level.chunk.storage.RegionStorageInfo;
 import pl.fuzjajadrowa.ingot.compression.CompressionRegistry;
 import pl.fuzjajadrowa.ingot.storage.IngotStorage;
 import pl.fuzjajadrowa.ingot.storage.StorageOptions;
+import pl.fuzjajadrowa.ingot.world.IngotWorldManager;
+import pl.fuzjajadrowa.ingot.world.IngotWorldManifest;
+import pl.fuzjajadrowa.ingot.world.WorldStorageDetector;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -33,9 +36,11 @@ import java.util.stream.Stream;
 public final class WorldConversionStager {
     private static final Pattern REGION_NAME = Pattern.compile("r\\.(-?\\d+)\\.(-?\\d+)\\.(mca|ir)");
     private static final Pattern EXTERNAL_CHUNK = Pattern.compile("c\\.(-?\\d+)\\.(-?\\d+)\\.mcc");
+    private static final Pattern INGOT_LOCK = Pattern.compile("r\\.-?\\d+\\.-?\\d+\\.ir\\.lock");
     private static final List<String> TYPES = List.of("region", "entities", "poi");
 
-    public record Result(Path stagingDirectory, ConversionDirection direction, long convertedRecords) { }
+    public record Result(Path stagingDirectory, ConversionDirection direction, long convertedRecords, java.util.UUID journalId) { }
+    public record PublicationResult(Path preservedSource, long verifiedRecords) { }
     private record StorageFolder(Path relative, String type, ResourceKey<Level> dimension) { }
     private record Region(Path source, int x, int z) { }
 
@@ -78,9 +83,8 @@ public final class WorldConversionStager {
                 // This stage intentionally stops before publication
                 journal = journal.advance(root, ConversionJournal.Phase.STAGED,
                         "verified staging=" + staging.getFileName() + "; publication not performed");
-                journal.clearAfterSuccessfulCompletion(root);
                 listener.accept(new ConversionProgress(ConversionProgress.Stage.COMPLETE, "Staging verified; source unchanged", regions.size(), regions.size()));
-                return new Result(staging, direction, converted);
+                return new Result(staging, direction, converted, journal.id());
             } catch (Exception failure) {
                 try {
                     ConversionJournal current = ConversionJournal.read(root);
@@ -92,6 +96,264 @@ public final class WorldConversionStager {
                 if (failure instanceof RuntimeException runtime) throw runtime;
                 throw new IOException("World conversion staging failed", failure);
             }
+        }
+    }
+
+    /** Publishes a staged copy and keeps the original region files in a transaction archive. */
+    public static PublicationResult publish(Path world, Result result, Consumer<ConversionProgress> progress) throws IOException {
+        Path requested = world.toAbsolutePath().normalize();
+        if (Files.isSymbolicLink(requested)) throw new IOException("World path is a symbolic link: " + requested);
+        Path root = requested.toRealPath();
+        Consumer<ConversionProgress> listener = progress == null ? ignored -> { } : progress;
+        try (WorldConversionLock ignored = IngotWorldManager.acquireConversionLock(root)) {
+            ConversionJournal journal = ConversionJournal.read(root);
+            Path staging = root.resolve(".ingot-conversion-stage-" + journal.id());
+            Path archive = root.resolve(".ingot-conversion-source-" + journal.id());
+            if (!journal.id().equals(result.journalId()) || journal.direction() != result.direction()
+                    || journal.phase() != ConversionJournal.Phase.STAGED
+                    || !result.stagingDirectory().toAbsolutePath().normalize().equals(staging)) {
+                throw new IOException("The staged conversion does not match the current world journal");
+            }
+            WorldStorageDetector.Detection detection = WorldStorageDetector.inspect(root);
+            validateSourceDuringPublication(root, detection, journal.direction());
+            List<StorageFolder> folders = discoverStorageFolders(root);
+            List<Path> sourceFiles = activeSourceFiles(root, folders, journal.direction());
+            List<Path> stagedFiles = stagedOutputFiles(staging, folders, journal.direction());
+            if (sourceFiles.isEmpty()) throw new IOException("No source storage files remain to publish from");
+            if (stagedFiles.isEmpty() && result.convertedRecords() != 0) throw new IOException("Verified staged files are missing");
+            if (Files.exists(archive, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Conversion source archive already exists: " + archive);
+
+            journal = journal.advance(root, ConversionJournal.Phase.PUBLICATION, "publication started");
+            try {
+                listener.accept(new ConversionProgress(ConversionProgress.Stage.PUBLICATION, "Preserving source storage", 0, sourceFiles.size()));
+                int done = 0;
+                for (Path source : sourceFiles) {
+                    Path relative = root.relativize(source);
+                    journal = journal.advance(root, ConversionJournal.Phase.PUBLICATION, "archiving " + relative);
+                    moveSafely(root, source, archive.resolve(relative));
+                    listener.accept(new ConversionProgress(ConversionProgress.Stage.PUBLICATION, "Preserving source storage", ++done, sourceFiles.size()));
+                }
+
+                done = 0;
+                for (Path staged : stagedFiles) {
+                    Path relative = staging.relativize(staged);
+                    Path target = root.resolve(relative);
+                    journal = journal.advance(root, ConversionJournal.Phase.PUBLICATION, "publishing " + relative);
+                    moveSafely(root, staged, target);
+                    listener.accept(new ConversionProgress(ConversionProgress.Stage.PUBLICATION, "Publishing converted regions", ++done, stagedFiles.size()));
+                }
+
+                List<Region> archivedRegions = regionsInArchive(archive, folders, journal.direction());
+                long verified = verifyPublished(root, archive, folders, archivedRegions, journal.direction(), listener);
+                if (verified != result.convertedRecords()) {
+                    throw new IOException("Published verification count mismatch: expected " + result.convertedRecords() + ", found " + verified);
+                }
+
+                if (journal.direction() == ConversionDirection.ANVIL_TO_INGOT) {
+                    new pl.fuzjajadrowa.ingot.world.IngotWorldManifest(java.util.UUID.randomUUID()).write(root);
+                } else {
+                    Path manifest = root.resolve(pl.fuzjajadrowa.ingot.world.IngotWorldManifest.FILE_NAME);
+                    if (!Files.isRegularFile(manifest, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(manifest)) {
+                        throw new IOException("The active Ingot manifest disappeared during publication");
+                    }
+                    moveSafely(root, manifest, archive.resolve(pl.fuzjajadrowa.ingot.world.IngotWorldManifest.FILE_NAME));
+                }
+                journal = journal.advance(root, ConversionJournal.Phase.COMPLETE, "published and verified; source archive=" + archive.getFileName());
+                journal.clearAfterSuccessfulCompletion(root);
+                return new PublicationResult(archive, verified);
+            } catch (Exception failure) {
+                try {
+                    rollbackPublication(root, staging, archive, folders, journal.direction(), journal);
+                } catch (Exception rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                }
+                if (failure instanceof IOException io) throw io;
+                if (failure instanceof RuntimeException runtime) throw runtime;
+                throw new IOException("World conversion publication failed", failure);
+            }
+        }
+    }
+
+    private static void validateSourceDuringPublication(Path root, WorldStorageDetector.Detection detection,
+                                                        ConversionDirection direction) throws IOException {
+        Path journalPath = root.resolve(ConversionJournal.FILE_NAME);
+        if (detection.unsafePaths().stream().anyMatch(path -> !path.equals(journalPath))) {
+            throw new IOException("Unsafe storage appeared after staging: " + detection.unsafePaths());
+        }
+        boolean sourceMatches = direction == ConversionDirection.ANVIL_TO_INGOT
+                ? detection.hasAnvil() && !detection.hasIngot()
+                    && Files.notExists(root.resolve(IngotWorldManifest.FILE_NAME), LinkOption.NOFOLLOW_LINKS)
+                : detection.hasIngot() && !detection.hasAnvil()
+                    && Files.isRegularFile(root.resolve(IngotWorldManifest.FILE_NAME), LinkOption.NOFOLLOW_LINKS);
+        if (!sourceMatches) throw new IOException("World storage changed after staging; source format is no longer " + direction.sourceFormat());
+        if (direction == ConversionDirection.INGOT_TO_ANVIL) IngotWorldManifest.read(root);
+    }
+
+    /** Rolls back an interrupted publication, or clears a journal from staging where source data was untouched. */
+    public static void recover(Path world) throws IOException {
+        Path requested = world.toAbsolutePath().normalize();
+        if (Files.isSymbolicLink(requested)) throw new IOException("World path is a symbolic link: " + requested);
+        Path root = requested.toRealPath();
+        try (WorldConversionLock ignored = IngotWorldManager.acquireConversionLock(root)) {
+            ConversionJournal journal = ConversionJournal.read(root);
+            Path staging = root.resolve(".ingot-conversion-stage-" + journal.id());
+            Path archive = root.resolve(".ingot-conversion-source-" + journal.id());
+            if (journal.phase() == ConversionJournal.Phase.PUBLICATION) {
+                List<StorageFolder> folders = discoverStorageFolders(root);
+                rollbackPublication(root, staging, archive, folders, journal.direction(), journal);
+            } else if (journal.phase() == ConversionJournal.Phase.COMPLETE) {
+                journal.clearAfterSuccessfulCompletion(root);
+            } else {
+                journal.clearAfterRecovery(root);
+            }
+        }
+    }
+
+    private static List<Path> activeSourceFiles(Path root, List<StorageFolder> folders, ConversionDirection direction) throws IOException {
+        List<Path> result = new ArrayList<>();
+        for (StorageFolder folder : folders) {
+            Path directory = sourceDirectory(root, folder, direction);
+            if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) continue;
+            try (Stream<Path> children = Files.list(directory)) {
+                for (Path file : children.toList()) {
+                    String name = file.getFileName().toString();
+                    Matcher region = REGION_NAME.matcher(name);
+                    boolean wanted = (region.matches() && region.group(3).equals(direction == ConversionDirection.ANVIL_TO_INGOT ? "mca" : "ir"))
+                            || (direction == ConversionDirection.ANVIL_TO_INGOT && EXTERNAL_CHUNK.matcher(name).matches())
+                            || (direction == ConversionDirection.INGOT_TO_ANVIL && INGOT_LOCK.matcher(name).matches());
+                    if (!wanted) continue;
+                    if (Files.isSymbolicLink(file) || !Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Unsafe active storage file: " + file);
+                    result.add(file);
+                }
+            }
+        }
+        result.sort(Comparator.comparing(p -> root.relativize(p).toString()));
+        return result;
+    }
+
+    private static List<Path> stagedOutputFiles(Path staging, List<StorageFolder> folders, ConversionDirection direction) throws IOException {
+        List<Path> result = new ArrayList<>();
+        for (StorageFolder folder : folders) {
+            Path directory = targetDirectory(staging, folder, direction);
+            if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) continue;
+            try (Stream<Path> children = Files.list(directory)) {
+                for (Path file : children.toList()) {
+                    String name = file.getFileName().toString();
+                    boolean wanted = direction == ConversionDirection.ANVIL_TO_INGOT
+                            ? REGION_NAME.matcher(name).matches() && name.endsWith(".ir")
+                            : (REGION_NAME.matcher(name).matches() && name.endsWith(".mca")) || EXTERNAL_CHUNK.matcher(name).matches();
+                    if (!wanted) continue;
+                    if (Files.isSymbolicLink(file) || !Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Unsafe staged output file: " + file);
+                    result.add(file);
+                }
+            }
+        }
+        result.sort(Comparator.comparing(p -> staging.relativize(p).toString()));
+        return result;
+    }
+
+    private static List<Region> regionsInArchive(Path archive, List<StorageFolder> folders, ConversionDirection direction) throws IOException {
+        List<Region> result = new ArrayList<>();
+        String extension = direction == ConversionDirection.ANVIL_TO_INGOT ? "mca" : "ir";
+        for (StorageFolder folder : folders) {
+            Path directory = archive.resolve(folder.relative());
+            if (direction == ConversionDirection.INGOT_TO_ANVIL) directory = directory.resolve("ingot");
+            if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) continue;
+            try (Stream<Path> children = Files.list(directory)) {
+                for (Path file : children.toList()) {
+                    Matcher matcher = REGION_NAME.matcher(file.getFileName().toString());
+                    if (!matcher.matches() || !matcher.group(3).equals(extension)) continue;
+                    result.add(new Region(file, Integer.parseInt(matcher.group(1)), Integer.parseInt(matcher.group(2))));
+                }
+            }
+        }
+        return result;
+    }
+
+    private static long verifyPublished(Path root, Path archive, List<StorageFolder> folders, List<Region> regions,
+                                        ConversionDirection direction, Consumer<ConversionProgress> listener) throws IOException {
+        long count = 0;
+        long done = 0;
+        for (Region region : regions) {
+            Path relative = archive.relativize(region.source());
+            StorageFolder folder = folders.stream().filter(f -> relative.startsWith(f.relative())).findFirst()
+                    .orElseThrow(() -> new IOException("Region archive is outside a storage directory: " + region.source()));
+            Path target = root.resolve(folder.relative());
+            if (direction == ConversionDirection.ANVIL_TO_INGOT) target = target.resolve("ingot");
+            listener.accept(new ConversionProgress(ConversionProgress.Stage.VERIFICATION,
+                    "Verifying published " + folder.type() + " region", ++done, regions.size()));
+            count += direction == ConversionDirection.ANVIL_TO_INGOT
+                    ? verifyAnvilToIngot(region, target, folder)
+                    : verifyIngotToAnvil(region, target, folder);
+        }
+        return count;
+    }
+
+    private static void rollbackPublication(Path root, Path staging, Path archive, List<StorageFolder> folders,
+                                            ConversionDirection direction, ConversionJournal journal) throws IOException {
+        List<Path> activeTargets = new ArrayList<>();
+        for (StorageFolder folder : folders) {
+            Path target = root.resolve(folder.relative());
+            if (direction == ConversionDirection.ANVIL_TO_INGOT) target = target.resolve("ingot");
+            if (!Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) continue;
+            try (Stream<Path> children = Files.list(target)) {
+                for (Path file : children.toList()) {
+                    String name = file.getFileName().toString();
+                    boolean generated = direction == ConversionDirection.ANVIL_TO_INGOT
+                            ? REGION_NAME.matcher(name).matches() && name.endsWith(".ir")
+                            : (REGION_NAME.matcher(name).matches() && name.endsWith(".mca")) || EXTERNAL_CHUNK.matcher(name).matches();
+                    if (generated) activeTargets.add(file);
+                }
+            }
+        }
+        for (Path file : activeTargets) {
+            if (Files.isSymbolicLink(file) || !Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Unsafe partially published file: " + file);
+            Path staged = staging.resolve(root.relativize(file));
+            moveSafely(root, file, staged);
+        }
+
+        if (Files.isDirectory(archive, LinkOption.NOFOLLOW_LINKS)) {
+            try (Stream<Path> paths = Files.walk(archive)) {
+                List<Path> archivedFiles = paths.filter(p -> Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)).sorted().toList();
+                for (Path file : archivedFiles) {
+                    Path original = root.resolve(archive.relativize(file));
+                    moveSafely(root, file, original);
+                }
+            }
+        }
+        if (direction == ConversionDirection.ANVIL_TO_INGOT) {
+            Path manifest = root.resolve(pl.fuzjajadrowa.ingot.world.IngotWorldManifest.FILE_NAME);
+            if (Files.exists(manifest, LinkOption.NOFOLLOW_LINKS)) {
+                if (Files.isSymbolicLink(manifest) || !Files.isRegularFile(manifest, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Unsafe Ingot manifest during rollback: " + manifest);
+                Files.delete(manifest);
+            }
+        }
+        ConversionJournal current = ConversionJournal.read(root);
+        if (current.phase() == ConversionJournal.Phase.PUBLICATION) {
+            current = current.advance(root, ConversionJournal.Phase.FAILED, "rollback completed; original storage restored");
+        }
+        current.clearAfterRecovery(root);
+    }
+
+    private static void moveSafely(Path root, Path source, Path target) throws IOException {
+        if (!source.normalize().startsWith(root) || !target.normalize().startsWith(root)) throw new IOException("Transaction path escaped world root");
+        if (Files.isSymbolicLink(source) || !Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Transaction source is missing or unsafe: " + source);
+        createSafeDirectories(root, target.getParent());
+        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Refusing to overwrite transaction destination: " + target);
+        try { Files.move(source, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE); }
+        catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
+            throw new IOException("Filesystem cannot atomically publish world storage", unsupported);
+        }
+    }
+
+    private static void createSafeDirectories(Path root, Path directory) throws IOException {
+        Path relative = root.relativize(directory.normalize());
+        Path current = root;
+        for (Path part : relative) {
+            current = current.resolve(part);
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                if (Files.isSymbolicLink(current) || !Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Unsafe transaction directory: " + current);
+            } else Files.createDirectory(current);
         }
     }
 
