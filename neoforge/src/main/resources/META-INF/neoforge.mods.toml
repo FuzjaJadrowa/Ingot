@@ -8,6 +8,7 @@ modId="ingot"
 version="${mod_version}"
 displayName="Ingot"
 description='''Next-generation Minecraft world save system.'''
+displayTest="IGNORE_SERVER_VERSION"
 logoFile="assets/ingot/icon.png"
 displayURL="https://modrinth.com/mod/ingot"
 
