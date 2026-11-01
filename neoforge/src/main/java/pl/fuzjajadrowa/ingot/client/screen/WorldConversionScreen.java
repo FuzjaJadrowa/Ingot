@@ -141,5 +141,10 @@ public final class WorldConversionScreen extends Screen {
         int top = height / 4 + 112;
         graphics.fill(left, top, left + barWidth, top + 8, 0xFF444444);
         graphics.fill(left, top, left + (int) (barWidth * displayProgress()), top + 8, 0xFFCCAA33);
+        if (progress.total() > 0) {
+            graphics.drawCenteredString(font,
+                    Component.translatable("optimizeWorld.progress.counter", progress.completed(), progress.total()),
+                    width / 2, top + 12, 0xA0A0A0);
+        }
     }
 }
