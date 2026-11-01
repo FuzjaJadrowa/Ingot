@@ -18,9 +18,5 @@ Dimensions added by other mods keep their normal directory paths.
 Worlds containing `.ir` files need Ingot to load those chunks. 
 Minecraft and external tools that expect `.mca` files cannot read Ingot regions.
 
-## 🐞 Known issues
-- There is no conversion between Anvil and Ingot.
-- Normal launcher was tested, production dedicated servers, large modpacks, and long-running performance benchmarks needs testing. Report any bugs using Github Issues.
-
 ## 📜 License
 This project is distributed under the **PIF-1.0** license.
