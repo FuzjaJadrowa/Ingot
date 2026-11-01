@@ -8,5 +8,10 @@
     "RegionFileStorageMixin",
     "IOWorkerMixin"
   ],
+  "client": [
+    "client.WorldSelectionListAccess",
+    "client.WorldListEntryMixin",
+    "client.SelectWorldScreenMixin"
+  ],
   "injectors": {"defaultRequire": 1}
 }
