@@ -11,11 +11,20 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import pl.fuzjajadrowa.ingot.conversion.WorldConversionLock;
 
 public final class IngotWorldManager {
     private static final Map<Path, Session> WORLDS = new LinkedHashMap<>();
 
     private IngotWorldManager() { }
+
+    public static synchronized boolean isWorldOpen(Path directory) throws IOException {
+        Path root = directory.toRealPath();
+        if (WorldConversionLock.isLocked(root)) {
+            throw new IOException("World conversion is in progress; refusing to open " + root);
+        }
+        return WORLDS.containsKey(root);
+    }
 
     public static final class Session {
         private final Path root;
