@@ -8,6 +8,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.Assert.*;
+import pl.fuzjajadrowa.ingot.world.IngotWorldManager;
 
 public class ConversionJournalTest {
     @Rule public final TemporaryFolder temporary = new TemporaryFolder();
@@ -50,5 +51,19 @@ public class ConversionJournalTest {
             } catch (java.io.IOException expected) { assertTrue(expected.getMessage().contains("already being converted")); }
         }
         try (WorldConversionLock ignored = WorldConversionLock.acquire(root)) { }
+    }
+
+    @Test public void openVanillaWorldRefusesConversionUntilServerClosesIt() throws Exception {
+        Path root = temporary.newFolder("open-vanilla").toPath();
+        Path regions = Files.createDirectories(root.resolve("region"));
+        Files.write(regions.resolve("r.0.0.mca"), new byte[] {1});
+        assertNull(IngotWorldManager.openWorld(root));
+        assertTrue(IngotWorldManager.isWorldOpen(root));
+        try {
+            WorldConversionPreflight.validateAndLock(root, ConversionDirection.ANVIL_TO_INGOT);
+            fail("An open Anvil world must not be staged");
+        } catch (java.io.IOException expected) { assertTrue(expected.getMessage().contains("Close the world")); }
+        IngotWorldManager.closeWorld(root, null);
+        assertFalse(IngotWorldManager.isWorldOpen(root));
     }
 }

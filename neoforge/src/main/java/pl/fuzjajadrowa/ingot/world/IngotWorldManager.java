@@ -15,15 +15,19 @@ import pl.fuzjajadrowa.ingot.conversion.WorldConversionLock;
 
 public final class IngotWorldManager {
     private static final Map<Path, Session> WORLDS = new LinkedHashMap<>();
+    private static final Set<Path> OPEN_ROOTS = new HashSet<>();
 
     private IngotWorldManager() { }
 
     public static synchronized boolean isWorldOpen(Path directory) throws IOException {
         Path root = directory.toRealPath();
-        if (WorldConversionLock.isLocked(root)) {
-            throw new IOException("World conversion is in progress; refusing to open " + root);
-        }
-        return WORLDS.containsKey(root);
+        return OPEN_ROOTS.contains(root);
+    }
+
+    public static synchronized WorldConversionLock acquireConversionLock(Path directory) throws IOException {
+        Path root = directory.toRealPath();
+        if (OPEN_ROOTS.contains(root)) throw new IOException("Close the world before converting it: " + root);
+        return WorldConversionLock.acquire(root);
     }
 
     public static final class Session {
@@ -76,12 +80,14 @@ public final class IngotWorldManager {
 
     public static synchronized Session openWorld(Path directory) throws IOException {
         Path selectedRoot = directory.toAbsolutePath().normalize();
+        if (Files.isSymbolicLink(selectedRoot)) throw new IOException("World root is a symbolic link: " + selectedRoot);
         Path root = directory.toRealPath();
         if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
             throw new IOException("World path is not a directory: " + root);
         }
-        if (WORLDS.containsKey(root)) throw new IOException("World already registered: " + root);
-        for (Path other : WORLDS.keySet()) {
+        if (WorldConversionLock.isLocked(root)) throw new IOException("World conversion is in progress; refusing to open " + root);
+        if (OPEN_ROOTS.contains(root)) throw new IOException("World already registered: " + root);
+        for (Path other : OPEN_ROOTS) {
             if (root.startsWith(other) || other.startsWith(root)) throw new IOException("Overlapping world roots: " + root + " and " + other);
         }
 
@@ -114,6 +120,7 @@ public final class IngotWorldManager {
             if (marked) {
                 throw new IOException("Anvil region data exists in a world marked for Ingot; mixed backends are not supported: " + root);
             }
+            OPEN_ROOTS.add(root);
             return null;
         }
 
@@ -121,6 +128,7 @@ public final class IngotWorldManager {
         if (!marked) new IngotWorldManifest(UUID.randomUUID()).write(root);
         Session session = new Session(root, selectedRoot);
         WORLDS.put(root, session);
+        OPEN_ROOTS.add(root);
         return session;
     }
 
@@ -153,11 +161,20 @@ public final class IngotWorldManager {
 
     public static void closeWorld(Session session) {
         if (session == null) return;
+        closeWorld(session.root, session);
+    }
+
+    public static void closeWorld(Path directory, Session session) {
+        Path root = directory == null ? (session == null ? null : session.root) : directory.toAbsolutePath().normalize();
+        if (root == null) return;
+        try { root = root.toRealPath(); }
+        catch (IOException ignored) { }
         try {
-            session.closeResources();
+            if (session != null) session.closeResources();
         } finally {
             synchronized (IngotWorldManager.class) {
-                WORLDS.remove(session.root, session);
+                OPEN_ROOTS.remove(root);
+                if (session != null) WORLDS.remove(session.root, session);
             }
         }
     }

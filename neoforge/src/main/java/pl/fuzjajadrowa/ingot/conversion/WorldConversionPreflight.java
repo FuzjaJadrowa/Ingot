@@ -15,8 +15,7 @@ public final class WorldConversionPreflight {
         Path requested = directory.toAbsolutePath().normalize();
         if (Files.isSymbolicLink(requested)) throw new IOException("World path is a symbolic link: " + requested);
         Path root = directory.toRealPath();
-        if (IngotWorldManager.isWorldOpen(root)) throw new IOException("Close the world before converting it: " + root);
-        WorldConversionLock lock = WorldConversionLock.acquire(root);
+        WorldConversionLock lock = IngotWorldManager.acquireConversionLock(root);
         boolean accepted = false;
         try {
             if (Files.exists(root.resolve(ConversionJournal.FILE_NAME), LinkOption.NOFOLLOW_LINKS)) {

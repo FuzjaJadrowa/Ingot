@@ -15,15 +15,18 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import java.io.IOException;
+import java.nio.file.Path;
 
 @Mixin(MinecraftServer.class)
 public abstract class MinecraftServerMixin {
     @Shadow @Final protected LevelStorageSource.LevelStorageAccess storageSource;
     @Unique private IngotWorldManager.Session ingot$session;
+    @Unique private Path ingot$worldRoot;
 
     @Inject(method = "<init>", at = @At("RETURN"))
     private void ingot$open(CallbackInfo ci) throws IOException {
-        ingot$session = IngotWorldManager.openWorld(storageSource.getLevelPath(LevelResource.ROOT));
+        ingot$worldRoot = storageSource.getLevelPath(LevelResource.ROOT);
+        ingot$session = IngotWorldManager.openWorld(ingot$worldRoot);
         if (ingot$session != null) Ingot.LOGGER.warn("Experimental Ingot authoritative storage active for {}", ingot$session.root());
     }
 
@@ -40,11 +43,11 @@ public abstract class MinecraftServerMixin {
 
     @Inject(method = "stopServer", at = @At("RETURN"))
     private void ingot$unregister(CallbackInfo ci) {
-        IngotWorldManager.closeWorld(ingot$session);
+        IngotWorldManager.closeWorld(ingot$worldRoot, ingot$session);
     }
 
     @Inject(method = "runServer", at = @At(value = "INVOKE", target = "Lnet/minecraft/server/MinecraftServer;onServerExit()V"))
     private void ingot$emergencyCleanup(CallbackInfo ci) {
-        IngotWorldManager.closeWorld(ingot$session);
+        IngotWorldManager.closeWorld(ingot$worldRoot, ingot$session);
     }
 }
