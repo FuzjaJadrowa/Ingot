@@ -12,15 +12,17 @@ import java.util.List;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
-final class WorldStorageDetector {
+public final class WorldStorageDetector {
     private static final Pattern ANVIL_REGION = Pattern.compile("r\\.-?\\d+\\.-?\\d+\\.mca");
     private static final Pattern ANVIL_EXTERNAL_CHUNK = Pattern.compile("c\\.-?\\d+\\.-?\\d+\\.mcc");
     private static final Pattern INGOT_REGION = Pattern.compile(
             "r\\.-?\\d+\\.-?\\d+\\.ir(?:\\.(?:uncommitted|compacting)-[^/]+)?(?:\\.lock)?");
     private static final List<String> STORAGE_NAMES = List.of("region", "entities", "poi");
 
-    record Detection(boolean hasAnvil, boolean hasIngot, List<Path> unsafePaths) {
-        boolean hasUnsafePaths() {
+    public enum Format { ANVIL, INGOT, EMPTY, MIXED, UNKNOWN, UNSAFE }
+
+    public record Detection(Format format, boolean hasAnvil, boolean hasIngot, List<Path> unsafePaths) {
+        public boolean hasUnsafePaths() {
             return !unsafePaths.isEmpty();
         }
     }
@@ -31,19 +33,38 @@ final class WorldStorageDetector {
         private final List<Path> unsafe = new ArrayList<>();
 
         private Detection result() {
-            return new Detection(anvil, ingot, List.copyOf(unsafe));
+            return new Detection(Format.UNKNOWN, anvil, ingot, List.copyOf(unsafe));
         }
     }
 
     private WorldStorageDetector() { }
 
-    static Detection inspect(Path worldRoot) throws IOException {
+    public static Detection inspect(Path worldRoot) throws IOException {
+        Path root = worldRoot.toAbsolutePath().normalize();
+        if (Files.isSymbolicLink(root) || !Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
+            return new Detection(Format.UNSAFE, false, false, List.of(root));
+        }
         Scan scan = new Scan();
-        inspectVanillaDimension(worldRoot, scan);
-        inspectLegacyDimension(worldRoot.resolve("DIM-1"), scan);
-        inspectLegacyDimension(worldRoot.resolve("DIM1"), scan);
-        inspectModdedDimensions(worldRoot.resolve("dimensions"), scan);
-        return scan.result();
+        inspectVanillaDimension(root, scan);
+        inspectLegacyDimension(root.resolve("DIM-1"), scan);
+        inspectLegacyDimension(root.resolve("DIM1"), scan);
+        inspectModdedDimensions(root.resolve("dimensions"), scan);
+        Detection raw = scan.result();
+        Path pendingManifest = root.resolve(IngotWorldManifest.FILE_NAME + ".pending");
+        Path conversionJournal = root.resolve("ingot-conversion.journal");
+        if (Files.exists(pendingManifest, LinkOption.NOFOLLOW_LINKS)) scan.unsafe.add(pendingManifest);
+        if (Files.exists(conversionJournal, LinkOption.NOFOLLOW_LINKS)) scan.unsafe.add(conversionJournal);
+        boolean marked = Files.exists(root.resolve(IngotWorldManifest.FILE_NAME), LinkOption.NOFOLLOW_LINKS);
+        if (marked) {
+            try { IngotWorldManifest.read(root); }
+            catch (IOException invalid) { scan.unsafe.add(root.resolve(IngotWorldManifest.FILE_NAME)); }
+        }
+        Format format = !scan.unsafe.isEmpty() ? Format.UNSAFE
+                : raw.hasAnvil() && raw.hasIngot() ? Format.MIXED
+                : raw.hasAnvil() ? (marked ? Format.UNSAFE : Format.ANVIL)
+                : raw.hasIngot() ? (marked ? Format.INGOT : Format.UNSAFE)
+                : marked ? Format.INGOT : Format.EMPTY;
+        return new Detection(format, raw.hasAnvil(), raw.hasIngot(), List.copyOf(scan.unsafe));
     }
 
     private static void inspectVanillaDimension(Path root, Scan scan) throws IOException {

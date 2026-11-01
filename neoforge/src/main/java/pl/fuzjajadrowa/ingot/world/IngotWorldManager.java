@@ -83,6 +83,11 @@ public final class IngotWorldManager {
             throw new IOException("Interrupted Ingot activation; inspect " + pending
                     + " and the world data before reopening. The file was left untouched.");
         }
+        Path conversionJournal = root.resolve("ingot-conversion.journal");
+        if (checkedExists(conversionJournal, "conversion journal")) {
+            throw new IOException("Interrupted world conversion; inspect " + conversionJournal
+                    + " and preserve all world files before reopening. No data was changed.");
+        }
         if (marked) IngotWorldManifest.read(root);
 
         WorldStorageDetector.Detection data = WorldStorageDetector.inspect(root);
