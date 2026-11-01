@@ -11,7 +11,10 @@
   "client": [
     "client.WorldSelectionListAccess",
     "client.WorldListEntryMixin",
-    "client.SelectWorldScreenMixin"
+    "client.SelectWorldScreenMixin",
+    "client.CreateWorldScreenMixin",
+    "client.CreateWorldWorldTabMixin",
+    "client.GridLayoutTabAccessor"
   ],
   "injectors": {"defaultRequire": 1}
 }

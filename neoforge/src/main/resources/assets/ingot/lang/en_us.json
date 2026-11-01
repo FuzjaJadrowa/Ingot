@@ -4,6 +4,7 @@
   "ingot.storage.format.empty": "Empty",
   "ingot.storage.format.mixed": "Mixed",
   "ingot.storage.format.unknown": "Unknown",
+  "ingot.createWorld.storageFormat": "World Storage Format",
   "ingot.button.convert": "Convert",
   "ingot.button.play": "Play",
   "ingot.button.convert.unavailable": "Conversion unavailable for this world",

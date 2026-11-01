@@ -5,6 +5,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -16,6 +17,7 @@ import pl.fuzjajadrowa.ingot.conversion.WorldConversionLock;
 public final class IngotWorldManager {
     private static final Map<Path, Session> WORLDS = new LinkedHashMap<>();
     private static final Set<Path> OPEN_ROOTS = new HashSet<>();
+    private static final Map<Path, WorldStorageDetector.Format> NEW_WORLD_FORMATS = new HashMap<>();
 
     private IngotWorldManager() { }
 
@@ -28,6 +30,13 @@ public final class IngotWorldManager {
         Path root = directory.toRealPath();
         if (OPEN_ROOTS.contains(root)) throw new IOException("Close the world before converting it: " + root);
         return WorldConversionLock.acquire(root);
+    }
+
+    public static synchronized void registerNewWorldFormat(Path directory, WorldStorageDetector.Format format) {
+        if (format != WorldStorageDetector.Format.ANVIL && format != WorldStorageDetector.Format.INGOT) {
+            throw new IllegalArgumentException("New worlds support only Anvil or Ingot storage");
+        }
+        NEW_WORLD_FORMATS.put(directory.toAbsolutePath().normalize(), format);
     }
 
     public static final class Session {
@@ -81,6 +90,7 @@ public final class IngotWorldManager {
     public static synchronized Session openWorld(Path directory) throws IOException {
         Path selectedRoot = directory.toAbsolutePath().normalize();
         if (Files.isSymbolicLink(selectedRoot)) throw new IOException("World root is a symbolic link: " + selectedRoot);
+        WorldStorageDetector.Format requestedFormat = NEW_WORLD_FORMATS.remove(selectedRoot);
         Path root = directory.toRealPath();
         if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
             throw new IOException("World path is not a directory: " + root);
@@ -116,6 +126,14 @@ public final class IngotWorldManager {
         if (data.hasIngot() && !marked) {
             throw new IOException("Ingot region data or recovery candidates exist without an Ingot manifest; refusing Anvil fallback: " + root);
         }
+        if (requestedFormat == WorldStorageDetector.Format.ANVIL) {
+            if (marked || data.hasIngot()) throw new IOException("Anvil was selected for a world containing Ingot data: " + root);
+            OPEN_ROOTS.add(root);
+            return null;
+        }
+        if (requestedFormat == WorldStorageDetector.Format.INGOT && data.hasAnvil()) {
+            throw new IOException("Ingot was selected for a world containing Anvil data: " + root);
+        }
         if (data.hasAnvil()) {
             if (marked) {
                 throw new IOException("Anvil region data exists in a world marked for Ingot; mixed backends are not supported: " + root);
@@ -124,7 +142,7 @@ public final class IngotWorldManager {
             return null;
         }
 
-        // A manifest is created only after inspection has completed without ambiguity.
+        // A manifest is created only after inspection has completed
         if (!marked) new IngotWorldManifest(UUID.randomUUID()).write(root);
         Session session = new Session(root, selectedRoot);
         WORLDS.put(root, session);
