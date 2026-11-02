@@ -11,6 +11,9 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.storage.RegionFile;
 import net.minecraft.world.level.chunk.storage.RegionStorageInfo;
 import pl.fuzjajadrowa.ingot.compression.CompressionRegistry;
+import pl.fuzjajadrowa.ingot.serialization.IcfCodec;
+import pl.fuzjajadrowa.ingot.serialization.IcfPayloadKind;
+import pl.fuzjajadrowa.ingot.serialization.NbtBinaryCodec;
 import pl.fuzjajadrowa.ingot.storage.IngotStorage;
 import pl.fuzjajadrowa.ingot.storage.StorageOptions;
 import pl.fuzjajadrowa.ingot.world.IngotWorldManager;
@@ -18,7 +21,6 @@ import pl.fuzjajadrowa.ingot.world.IngotWorldManifest;
 import pl.fuzjajadrowa.ingot.world.WorldStorageDetector;
 
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -460,14 +462,15 @@ public final class WorldConversionStager {
     private static long copyAnvilToIngot(Region source, Path target, StorageFolder folder) throws IOException {
         long records = 0;
         RegionStorageInfo info = info(folder);
+        StorageOptions options = StorageOptions.defaults(true);
         try (RegionFile input = new RegionFile(info, source.source(), source.source().getParent(), false);
-             IngotStorage output = new IngotStorage(target, StorageOptions.defaults(true), CompressionRegistry.defaults(), ignored -> { })) {
+             IngotStorage output = new IngotStorage(target, options, CompressionRegistry.defaults(), ignored -> { })) {
             for (int dz = 0; dz < 32; dz++) for (int dx = 0; dx < 32; dx++) {
                 ChunkPos pos = new ChunkPos((source.x() << 5) + dx, (source.z() << 5) + dz);
                 try (DataInputStream data = input.getChunkDataInputStream(pos)) {
                     if (data == null) continue;
-                    CompoundTag tag = NbtIo.read(data, NbtAccounter.create(64L * 1024 * 1024));
-                    output.write(pos.x, pos.z, encode(tag));
+                    CompoundTag tag = NbtIo.read(data, NbtAccounter.create(options.maxRawBytes()));
+                    output.write(pos.x, pos.z, IcfCodec.encode(tag, payloadKind(folder), options.maxRawBytes()));
                     records++;
                 }
             }
@@ -478,16 +481,17 @@ public final class WorldConversionStager {
 
     private static long copyIngotToAnvil(Region source, Path target, StorageFolder folder) throws IOException {
         long records = 0;
+        StorageOptions options = StorageOptions.defaults(false);
         Files.createDirectories(target);
         RegionStorageInfo info = info(folder);
         Path targetFile = target.resolve("r." + source.x() + "." + source.z() + ".mca");
-        try (IngotStorage input = new IngotStorage(source.source().getParent(), StorageOptions.defaults(false), CompressionRegistry.defaults(), ignored -> { });
+        try (IngotStorage input = new IngotStorage(source.source().getParent(), options, CompressionRegistry.defaults(), ignored -> { });
              RegionFile output = new RegionFile(info, targetFile, target, true)) {
             for (int dz = 0; dz < 32; dz++) for (int dx = 0; dx < 32; dx++) {
                 int x = (source.x() << 5) + dx, z = (source.z() << 5) + dz;
                 byte[] bytes = input.read(x, z);
                 if (bytes == null) continue;
-                CompoundTag tag = decode(bytes);
+                CompoundTag tag = decode(bytes, payloadKind(folder), options.maxRawBytes());
                 try (DataOutputStream data = output.getChunkDataOutputStream(new ChunkPos(x, z))) {
                     NbtIo.write(tag, data);
                 }
@@ -519,6 +523,7 @@ public final class WorldConversionStager {
 
     private static long verifyAnvilToIngot(Region source, Path target, StorageFolder folder) throws IOException {
         long count = 0;
+        StorageOptions options = StorageOptions.defaults(false);
         try (RegionFile input = new RegionFile(info(folder), source.source(), source.source().getParent(), false);
              IngotStorage output = new IngotStorage(target, StorageOptions.defaults(false), CompressionRegistry.defaults(), ignored -> { })) {
             for (int dz = 0; dz < 32; dz++) for (int dx = 0; dx < 32; dx++) {
@@ -529,10 +534,12 @@ public final class WorldConversionStager {
                         if (output.contains(x, z)) throw new IOException("Unexpected staged Ingot record at " + x + "," + z);
                         continue;
                     }
-                    expected = NbtIo.read(data, NbtAccounter.create(64L * 1024 * 1024));
+                    expected = NbtIo.read(data, NbtAccounter.create(options.maxRawBytes()));
                 }
                 byte[] bytes = output.read(x, z);
-                if (bytes == null || !expected.equals(decode(bytes))) throw new IOException("Staged Ingot data mismatch at " + x + "," + z);
+                if (bytes == null || !expected.equals(decode(bytes, payloadKind(folder), options.maxRawBytes()))) {
+                    throw new IOException("Staged Ingot data mismatch at " + x + "," + z);
+                }
                 count++;
             }
         }
@@ -541,8 +548,9 @@ public final class WorldConversionStager {
 
     private static long verifyIngotToAnvil(Region source, Path target, StorageFolder folder) throws IOException {
         long count = 0;
+        StorageOptions options = StorageOptions.defaults(false);
         Path targetFile = target.resolve("r." + source.x() + "." + source.z() + ".mca");
-        try (IngotStorage input = new IngotStorage(source.source().getParent(), StorageOptions.defaults(false), CompressionRegistry.defaults(), ignored -> { });
+        try (IngotStorage input = new IngotStorage(source.source().getParent(), options, CompressionRegistry.defaults(), ignored -> { });
              RegionFile output = new RegionFile(info(folder), targetFile, target, false)) {
             for (int dz = 0; dz < 32; dz++) for (int dx = 0; dx < 32; dx++) {
                 int x = (source.x() << 5) + dx, z = (source.z() << 5) + dz;
@@ -551,7 +559,7 @@ public final class WorldConversionStager {
                     if (output.doesChunkExist(new ChunkPos(x, z))) throw new IOException("Unexpected staged Anvil chunk at " + x + "," + z);
                     continue;
                 }
-                CompoundTag expected = decode(bytes);
+                CompoundTag expected = decode(bytes, payloadKind(folder), options.maxRawBytes());
                 try (DataInputStream data = output.getChunkDataInputStream(new ChunkPos(x, z))) {
                     if (data == null || !expected.equals(NbtIo.read(data, NbtAccounter.create(64L * 1024 * 1024)))) {
                         throw new IOException("Staged Anvil data mismatch at " + x + "," + z);
@@ -567,15 +575,21 @@ public final class WorldConversionStager {
         return new RegionStorageInfo("IngotConversion", folder.dimension(), folder.type());
     }
 
-    private static byte[] encode(CompoundTag tag) throws IOException {
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        try (DataOutputStream out = new DataOutputStream(bytes)) { NbtIo.write(tag, out); }
-        return bytes.toByteArray();
+    private static IcfPayloadKind payloadKind(StorageFolder folder) {
+        return switch (folder.type()) {
+            case "region" -> IcfPayloadKind.CHUNK;
+            case "entities" -> IcfPayloadKind.ENTITIES;
+            case "poi" -> IcfPayloadKind.POI;
+            default -> throw new IllegalArgumentException("Unsupported conversion storage type: " + folder.type());
+        };
     }
 
-    private static CompoundTag decode(byte[] bytes) throws IOException {
+    private static CompoundTag decode(byte[] bytes, IcfPayloadKind kind, int maxRawBytes) throws IOException {
+        if (IcfCodec.isIcfPayload(bytes)) {
+            return IcfCodec.decode(bytes, kind, NbtBinaryCodec.Limits.forRawBytes(maxRawBytes));
+        }
         try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(bytes))) {
-            CompoundTag result = NbtIo.read(input, NbtAccounter.create(64L * 1024 * 1024));
+            CompoundTag result = NbtIo.read(input, NbtAccounter.create(maxRawBytes));
             if (input.available() != 0) throw new IOException("Trailing bytes after NBT compound");
             return result;
         }
