@@ -11,6 +11,11 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import pl.fuzjajadrowa.ingot.world.IngotWorldManifest;
 import pl.fuzjajadrowa.ingot.world.WorldStorageDetector;
+import pl.fuzjajadrowa.ingot.compression.CompressionRegistry;
+import pl.fuzjajadrowa.ingot.serialization.IcfCodec;
+import pl.fuzjajadrowa.ingot.serialization.IcfPayloadKind;
+import pl.fuzjajadrowa.ingot.storage.IngotStorage;
+import pl.fuzjajadrowa.ingot.storage.StorageOptions;
 
 import java.io.DataOutputStream;
 import java.nio.file.Files;
@@ -62,6 +67,38 @@ public class WorldConversionStagerTest {
         assertTrue(Files.exists(secondPublish.preservedSource().resolve("region/ingot/r.-1.2.ir")));
         assertEquals(WorldStorageDetector.Format.ANVIL, WorldStorageDetector.inspect(world).format());
         assertFalse(Files.exists(world.resolve(IngotWorldManifest.FILE_NAME)));
+    }
+
+    @Test public void convertsChunksEntitiesAndPoiToTheirMatchingIcfKinds() throws Exception {
+        Path world = temporary.newFolder("all-storage-kinds").toPath();
+        String[] folders = {"region", "entities", "poi"};
+        String[] vanillaTypes = {"chunk", "entities", "poi"};
+        IcfPayloadKind[] kinds = {IcfPayloadKind.CHUNK, IcfPayloadKind.ENTITIES, IcfPayloadKind.POI};
+        for (int index = 0; index < folders.length; index++) {
+            Path directory = Files.createDirectories(world.resolve(folders[index]));
+            CompoundTag tag = new CompoundTag();
+            tag.putInt("storageKind", index);
+            RegionStorageInfo info = new RegionStorageInfo("test", Level.OVERWORLD, vanillaTypes[index]);
+            try (RegionFile region = new RegionFile(info, directory.resolve("r.0.0.mca"), directory, true);
+                 DataOutputStream output = region.getChunkDataOutputStream(new ChunkPos(index, 2))) {
+                NbtIo.write(tag, output);
+            }
+        }
+
+        WorldConversionStager.Result staged = WorldConversionStager.stage(world,
+                ConversionDirection.ANVIL_TO_INGOT, ignored -> { });
+        assertEquals(3L, staged.convertedRecords());
+        for (int index = 0; index < folders.length; index++) {
+            Path directory = staged.stagingDirectory().resolve(folders[index]).resolve("ingot");
+            try (IngotStorage storage = new IngotStorage(directory, StorageOptions.defaults(false),
+                    CompressionRegistry.defaults(), ignored -> { })) {
+                byte[] payload = storage.read(index, 2);
+                assertTrue("Expected ICF payload for " + folders[index], IcfCodec.isIcfPayload(payload));
+                CompoundTag decoded = IcfCodec.decode(payload, kinds[index],
+                        pl.fuzjajadrowa.ingot.serialization.NbtBinaryCodec.Limits.forRawBytes(64 * 1024 * 1024));
+                assertEquals(index, decoded.getInt("storageKind"));
+            }
+        }
     }
 
     @Test public void failedPublicationRollsBackToOriginalAnvilFiles() throws Exception {

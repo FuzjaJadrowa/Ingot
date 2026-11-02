@@ -41,6 +41,7 @@ public final class NbtBinaryCodec {
     private static final int COMPOUND = 10;
     private static final int INT_ARRAY = 11;
     private static final int LONG_ARRAY = 12;
+    private static final byte[] CURRENT_ENCODING_MAGIC = {'N', 'B', 'T', 2};
 
     public record Limits(int maxBytes, int maxDepth, int maxNodes, int maxStringChars) {
         public Limits {
@@ -56,12 +57,12 @@ public final class NbtBinaryCodec {
 
     private NbtBinaryCodec() { }
 
-    /** Encodes the compound payload without an ICF envelope. Strings are UTF-16BE code units. */
     public static byte[] encode(CompoundTag root, int maxBytes) throws IOException {
         Objects.requireNonNull(root, "root");
         if (maxBytes < 1) throw new IllegalArgumentException("Invalid maximum byte count");
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         DataOutputStream output = new DataOutputStream(new BoundedOutputStream(bytes, maxBytes));
+        output.write(CURRENT_ENCODING_MAGIC);
         writeCompound(root, output, 0, new WriteState(maxBytes));
         output.flush();
         return bytes.toByteArray();
@@ -71,6 +72,7 @@ public final class NbtBinaryCodec {
         Objects.requireNonNull(bytes, "bytes");
         Objects.requireNonNull(limits, "limits");
         if (bytes.length > limits.maxBytes()) throw new IOException("ICF NBT exceeds configured byte limit");
+        if (!hasCurrentEncodingMagic(bytes)) throw new IOException("Unsupported ICF NBT body encoding");
         Reader reader = new Reader(bytes, limits);
         CompoundTag root = reader.readCompound(0);
         if (!reader.atEnd()) throw new IOException("Unexpected trailing bytes after ICF NBT compound");
@@ -143,10 +145,36 @@ public final class NbtBinaryCodec {
     }
 
     private static void writeString(String value, DataOutputStream output, int maxBytes) throws IOException {
-        long encodedBytes = (long) value.length() * 2;
-        if (value.length() > maxBytes || encodedBytes > maxBytes) throw new IOException("ICF NBT string exceeds byte limit");
-        writeLength(value.length(), output);
-        for (int index = 0; index < value.length(); index++) output.writeChar(value.charAt(index));
+        long encodedBytes = 0;
+        for (int index = 0; index < value.length(); index++) {
+            char unit = value.charAt(index);
+            encodedBytes += unit <= 0x7f ? 1 : unit <= 0x7ff ? 2 : 3;
+            if (encodedBytes > maxBytes || value.length() > maxBytes / 2) {
+                throw new IOException("ICF NBT string exceeds byte limit");
+            }
+        }
+        writeLength((int) encodedBytes, output);
+        for (int index = 0; index < value.length(); index++) {
+            int unit = value.charAt(index);
+            if (unit <= 0x7f) {
+                output.writeByte(unit);
+            } else if (unit <= 0x7ff) {
+                output.writeByte(0xc0 | (unit >>> 6));
+                output.writeByte(0x80 | (unit & 0x3f));
+            } else {
+                output.writeByte(0xe0 | (unit >>> 12));
+                output.writeByte(0x80 | ((unit >>> 6) & 0x3f));
+                output.writeByte(0x80 | (unit & 0x3f));
+            }
+        }
+    }
+
+    private static boolean hasCurrentEncodingMagic(byte[] bytes) {
+        if (bytes.length < CURRENT_ENCODING_MAGIC.length) return false;
+        for (int index = 0; index < CURRENT_ENCODING_MAGIC.length; index++) {
+            if (bytes[index] != CURRENT_ENCODING_MAGIC[index]) return false;
+        }
+        return true;
     }
 
     private static void writeLength(int length, DataOutputStream output) throws IOException {
@@ -179,7 +207,11 @@ public final class NbtBinaryCodec {
         private int offset;
         private int nodes;
 
-        private Reader(byte[] bytes, Limits limits) { this.bytes = bytes; this.limits = limits; }
+        private Reader(byte[] bytes, Limits limits) {
+            this.bytes = bytes;
+            this.limits = limits;
+            this.offset = CURRENT_ENCODING_MAGIC.length;
+        }
         private boolean atEnd() { return offset == bytes.length; }
 
         private CompoundTag readCompound(int depth) throws IOException {
@@ -224,7 +256,7 @@ public final class NbtBinaryCodec {
             if (count > bytes.length - offset) throw new IOException("Truncated ICF NBT list");
             ListTag result;
             if (count == 0 && elementType != END) {
-                // Minecraft's public ListTag constructor cannot set the element type of an empty list.
+                // Minecraft public ListTag constructor cannot set the element type of an empty list.
                 byte[] emptyList = {(byte) elementType, 0, 0, 0, 0};
                 result = ListTag.TYPE.load(new DataInputStream(new ByteArrayInputStream(emptyList)), NbtAccounter.unlimitedHeap());
                 return result;
@@ -239,13 +271,52 @@ public final class NbtBinaryCodec {
         }
 
         private String readString() throws IOException {
-            int chars = readLength();
-            if (chars > limits.maxStringChars()) throw new IOException("ICF NBT string exceeds configured character limit");
-            long byteCount = (long) chars * 2;
-            requireBytes(byteCount);
+            int length = readLength();
+            requireBytes(length);
+            int chars = decodeUtf8CodeUnits(offset, length, null);
+            if (chars > limits.maxStringChars()) {
+                throw new IOException("ICF NBT string exceeds configured character limit");
+            }
             char[] value = new char[chars];
-            for (int index = 0; index < chars; index++) value[index] = (char) readUnsignedShort();
+            decodeUtf8CodeUnits(offset, length, value);
+            offset += length;
             return new String(value);
+        }
+
+        private int decodeUtf8CodeUnits(int start, int length, char[] output) throws IOException {
+            int end = start + length;
+            int cursor = start;
+            int chars = 0;
+            while (cursor < end) {
+                int first = Byte.toUnsignedInt(bytes[cursor++]);
+                int value;
+                if (first <= 0x7f) {
+                    value = first;
+                } else if (first >= 0xc2 && first <= 0xdf) {
+                    if (cursor >= end) throw new IOException("Truncated ICF NBT string sequence");
+                    int second = continuation(bytes[cursor++]);
+                    value = ((first & 0x1f) << 6) | second;
+                } else if (first >= 0xe0 && first <= 0xef) {
+                    if (cursor + 1 >= end) throw new IOException("Truncated ICF NBT string sequence");
+                    int secondByte = Byte.toUnsignedInt(bytes[cursor++]);
+                    if ((secondByte & 0xc0) != 0x80 || (first == 0xe0 && secondByte < 0xa0)) {
+                        throw new IOException("Malformed ICF NBT string sequence");
+                    }
+                    int third = continuation(bytes[cursor++]);
+                    value = ((first & 0x0f) << 12) | ((secondByte & 0x3f) << 6) | third;
+                } else {
+                    throw new IOException("Malformed ICF NBT string sequence");
+                }
+                if (output != null) output[chars] = (char) value;
+                chars++;
+            }
+            return chars;
+        }
+
+        private int continuation(byte value) throws IOException {
+            int unsigned = Byte.toUnsignedInt(value);
+            if ((unsigned & 0xc0) != 0x80) throw new IOException("Malformed ICF NBT string continuation");
+            return unsigned & 0x3f;
         }
 
         private byte[] readByteArray(int length) throws IOException {
