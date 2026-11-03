@@ -198,6 +198,26 @@ public class IngotStorageTest {
         }
     }
 
+    @Test public void skipsIdenticalPayloadWritesButAppendsChangedPayloads() throws Exception {
+        Path regionPath = temporary.getRoot().toPath().resolve("r.0.0.ir");
+        byte[] original = {3, 1, 4, 1, 5};
+        try (IngotRegionFile region = new IngotRegionFile(regionPath, 0, 0,
+                StorageOptions.defaults(false), CompressionRegistry.defaults())) {
+            region.write(0, 0, original);
+            long firstWriteSize = Files.size(regionPath);
+
+            region.write(0, 0, original.clone());
+            assertEquals(firstWriteSize, Files.size(regionPath));
+            assertEquals(1, region.statistics().committedRecords());
+
+            byte[] changed = {3, 1, 4, 1, 6};
+            region.write(0, 0, changed);
+            assertTrue(Files.size(regionPath) > firstWriteSize);
+            assertEquals(2, region.statistics().committedRecords());
+            assertArrayEquals(changed, region.read(0, 0));
+        }
+    }
+
     @Test public void removesOrphanCandidateOnlyAfterActiveRegionValidates() throws Exception {
         Path directory = temporary.getRoot().toPath().resolve("ingot");
         Files.createDirectories(directory);

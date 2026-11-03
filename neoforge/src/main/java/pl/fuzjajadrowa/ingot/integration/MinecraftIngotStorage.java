@@ -4,9 +4,6 @@ import pl.fuzjajadrowa.ingot.Ingot;
 import pl.fuzjajadrowa.ingot.compression.CompressionRegistry;
 import pl.fuzjajadrowa.ingot.storage.IngotStorage;
 import pl.fuzjajadrowa.ingot.storage.StorageOptions;
-import pl.fuzjajadrowa.ingot.serialization.IcfCodec;
-import pl.fuzjajadrowa.ingot.serialization.IcfPayloadKind;
-import pl.fuzjajadrowa.ingot.serialization.NbtBinaryCodec;
 import pl.fuzjajadrowa.ingot.world.IngotWorldManager;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
@@ -14,20 +11,20 @@ import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.StreamTagVisitor;
 import net.minecraft.world.level.ChunkPos;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.file.Path;
 
 public final class MinecraftIngotStorage implements AutoCloseable {
     private final IngotWorldManager.Session session;
     private final StorageOptions options;
     private final IngotStorage storage;
-    private final IcfPayloadKind payloadKind;
 
-    public MinecraftIngotStorage(Path vanillaFolder, boolean sync, IngotWorldManager.Session session,
-                                 IcfPayloadKind payloadKind) {
+    public MinecraftIngotStorage(Path vanillaFolder, boolean sync, IngotWorldManager.Session session) {
         this.session = session;
-        this.payloadKind = payloadKind;
         this.options = StorageOptions.defaults(sync);
         this.storage = new IngotStorage(vanillaFolder.resolve("ingot"), options, CompressionRegistry.defaults(),
                 path -> Ingot.LOGGER.warn("Recovered incomplete Ingot append; original tail preserved at {}", path),
@@ -40,9 +37,6 @@ public final class MinecraftIngotStorage implements AutoCloseable {
         try {
             byte[] bytes = storage.read(pos.x, pos.z);
             if (bytes == null) return null;
-            if (IcfCodec.isIcfPayload(bytes)) {
-                return IcfCodec.decode(bytes, payloadKind, NbtBinaryCodec.Limits.forRawBytes(options.maxRawBytes()));
-            }
             try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(bytes))) {
                 CompoundTag tag = NbtIo.read(input, NbtAccounter.create(options.maxRawBytes()));
                 if (input.available() != 0) throw new IOException("Trailing NBT bytes at " + pos);
@@ -56,14 +50,6 @@ public final class MinecraftIngotStorage implements AutoCloseable {
         try {
             byte[] bytes = storage.read(pos.x, pos.z);
             if (bytes != null) {
-                if (IcfCodec.isIcfPayload(bytes)) {
-                    CompoundTag tag = IcfCodec.decode(bytes, payloadKind,
-                            NbtBinaryCodec.Limits.forRawBytes(options.maxRawBytes()));
-                    if (visitor.visitRootEntry(CompoundTag.TYPE) == StreamTagVisitor.ValueResult.CONTINUE) {
-                        tag.accept(visitor);
-                    }
-                    return;
-                }
                 try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(bytes))) {
                     NbtIo.parse(input, visitor, NbtAccounter.create(options.maxRawBytes()));
                 }
@@ -75,7 +61,21 @@ public final class MinecraftIngotStorage implements AutoCloseable {
         session.checkHealthy();
         try {
             if (tag == null) { storage.write(pos.x, pos.z, null); return; }
-            storage.write(pos.x, pos.z, IcfCodec.encode(tag, payloadKind, options.maxRawBytes()));
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (DataOutputStream output = new DataOutputStream(new OutputStream() {
+                private int count;
+                @Override public void write(int value) throws IOException {
+                    reserve(1); bytes.write(value);
+                }
+                @Override public void write(byte[] data, int offset, int length) throws IOException {
+                    reserve(length); bytes.write(data, offset, length);
+                }
+                private void reserve(int length) throws IOException {
+                    if (length < 0 || length > options.maxRawBytes() - count) throw new IOException("NBT exceeds Ingot byte limit");
+                    count += length;
+                }
+            })) { NbtIo.write(tag, output); }
+            storage.write(pos.x, pos.z, bytes.toByteArray());
         } catch (IOException | RuntimeException e) { throw session.fail(e); }
     }
 

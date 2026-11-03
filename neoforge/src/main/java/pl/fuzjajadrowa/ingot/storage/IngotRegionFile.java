@@ -432,11 +432,19 @@ public final class IngotRegionFile implements AutoCloseable {
     public synchronized void write(int chunkX, int chunkZ, byte[] payload) throws IOException {
         checkOpen();
         int slot = checkedSlot(chunkX, chunkZ);
-        if (payload == null) { append(chunkX, chunkZ, slot, 2, new byte[0], 0, 0); return; }
+        Entry current = index[slot];
+        if (payload == null) {
+            if (current == null) return;
+            append(chunkX, chunkZ, slot, 2, new byte[0], 0, 0);
+            return;
+        }
         if (payload.length > options.maxRawBytes()) throw new IOException("Payload exceeds raw byte limit");
+        int payloadCrc = crc(payload, 0, payload.length);
+        if (current != null && current.rawLength() == payload.length && current.rawCrc() == payloadCrc
+                && java.util.Arrays.equals(read(chunkX, chunkZ), payload)) return;
         byte[] compressed = codecs.require(1).compress(payload);
         if (compressed.length > options.maxCompressedBytes()) throw new IOException("Payload exceeds compressed byte limit");
-        append(chunkX, chunkZ, slot, 1, compressed, payload.length, crc(payload, 0, payload.length));
+        append(chunkX, chunkZ, slot, 1, compressed, payload.length, payloadCrc);
     }
 
     public synchronized void delete(int chunkX, int chunkZ) throws IOException { write(chunkX, chunkZ, null); }

@@ -347,7 +347,9 @@ public class IngotRegionFileTest {
         try (IngotRegionFile region = new IngotRegionFile(path, 0, 0, largeOptions, codecs)) {
             region.write(0, 0, payload);
             assertFalse(region.statistics().compactionRecommended());
-            region.write(0, 0, payload);
+            byte[] updated = payload.clone();
+            updated[0] ^= 1;
+            region.write(0, 0, updated);
             assertTrue(region.statistics().compactionRecommended());
         }
     }

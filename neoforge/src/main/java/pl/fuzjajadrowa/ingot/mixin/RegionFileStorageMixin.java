@@ -26,8 +26,7 @@ public abstract class RegionFileStorageMixin implements IngotStorageAccess {
     private void ingot$initialize(RegionStorageInfo info, Path folder, boolean sync, CallbackInfo ci) throws IOException {
         if (!VanillaRegionStorageTypes.usesIngotStorageType(info.type())) return;
         IngotWorldManager.Session session = IngotWorldManager.forFolder(folder);
-        if (session != null) ingot$storage = new MinecraftIngotStorage(folder, sync, session,
-                VanillaRegionStorageTypes.payloadKind(info.type()));
+        if (session != null) ingot$storage = new MinecraftIngotStorage(folder, sync, session);
     }
 
     @Override public MinecraftIngotStorage ingot$backend() { return ingot$storage; }
