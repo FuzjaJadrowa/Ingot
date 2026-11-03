@@ -90,6 +90,19 @@ tasks.register<JavaExec>("serializationBenchmark") {
         systemProperty("ingot.minecraft", minecraftVersion)
     }
 }
+tasks.register<JavaExec>("worldStorageBenchmark") {
+    description = "Measures Anvil storage and estimates compacted Ingot size for one complete Minecraft world."
+    group = "verification"
+    dependsOn(benchmarkSourceSet.classesTaskName)
+    classpath = benchmarkSourceSet.runtimeClasspath
+    mainClass.set("pl.fuzjajadrowa.ingot.benchmark.WorldStorageBenchmark")
+    val world = providers.gradleProperty("benchmarkWorld")
+    val report = layout.buildDirectory.dir("reports/ingot-benchmark")
+    doFirst {
+        require(world.isPresent) { "Pass -PbenchmarkWorld=<Minecraft world directory>" }
+        args(world.get(), report.get().asFile.absolutePath)
+    }
+}
 tasks.jar {
     manifest.attributes("Implementation-Version" to project.version)
     archiveFileName.set("$modName-$modLoader-$modVersion+$minecraftVersion-build.$buildNumber.jar")

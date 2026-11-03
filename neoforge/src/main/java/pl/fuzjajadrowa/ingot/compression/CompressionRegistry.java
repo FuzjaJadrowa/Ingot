@@ -17,7 +17,7 @@ public final class CompressionRegistry {
         this.codecs = Map.copyOf(entries);
     }
 
-    public static CompressionRegistry defaults() { return new CompressionRegistry(new ZstdCodec(3)); }
+    public static CompressionRegistry defaults() { return new CompressionRegistry(new ZstdCodec(6)); }
 
     public CompressionCodec require(int id) throws IOException {
         CompressionCodec codec = codecs.get(id);

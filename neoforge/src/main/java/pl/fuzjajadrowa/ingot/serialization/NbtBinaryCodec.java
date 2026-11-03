@@ -117,16 +117,75 @@ public final class NbtBinaryCodec {
             case COMPOUND -> writeCompound((CompoundTag) tag, output, depth, state);
             case INT_ARRAY -> {
                 int[] value = ((IntArrayTag) tag).getAsIntArray();
-                writeLength(value.length, output);
-                for (int element : value) output.writeInt(element);
+                writeIntArray(value, output);
             }
             case LONG_ARRAY -> {
                 long[] value = ((LongArrayTag) tag).getAsLongArray();
-                writeLength(value.length, output);
-                for (long element : value) output.writeLong(element);
+                writeLongArray(value, output);
             }
             default -> throw new IOException("Unsupported NBT tag type " + Byte.toUnsignedInt(tag.getId()));
         }
+    }
+
+    private static void writeIntArray(int[] values, DataOutputStream output) throws IOException {
+        long variableBytes = 0;
+        for (int value : values) variableBytes += unsignedVarIntSize((value << 1) ^ (value >> 31));
+        boolean compact = variableBytes < (long) values.length * Integer.BYTES;
+        writeArrayHeader(values.length, compact, output);
+        if (compact) {
+            for (int value : values) writeUnsignedVarInt((value << 1) ^ (value >> 31), output);
+        } else {
+            for (int value : values) output.writeInt(value);
+        }
+    }
+
+    private static void writeLongArray(long[] values, DataOutputStream output) throws IOException {
+        long variableBytes = 0;
+        long fixedBytes = (long) values.length * Long.BYTES;
+        for (long value : values) {
+            variableBytes += unsignedVarLongSize((value << 1) ^ (value >> 63));
+            if (variableBytes >= fixedBytes) break;
+        }
+        boolean compact = variableBytes < fixedBytes;
+        writeArrayHeader(values.length, compact, output);
+        if (compact) {
+            for (long value : values) writeUnsignedVarLong((value << 1) ^ (value >> 63), output);
+        } else {
+            for (long value : values) output.writeLong(value);
+        }
+    }
+
+    private static void writeArrayHeader(int length, boolean compact, DataOutputStream output) throws IOException {
+        if (length > Integer.MAX_VALUE >>> 1) throw new IOException("ICF NBT array is too long");
+        writeLength((length << 1) | (compact ? 1 : 0), output);
+    }
+
+    private static void writeUnsignedVarInt(int value, DataOutputStream output) throws IOException {
+        while ((value & ~0x7f) != 0) {
+            output.writeByte((value & 0x7f) | 0x80);
+            value >>>= 7;
+        }
+        output.writeByte(value);
+    }
+
+    private static int unsignedVarIntSize(int value) {
+        int size = 1;
+        while ((value & ~0x7f) != 0) { size++; value >>>= 7; }
+        return size;
+    }
+
+    private static void writeUnsignedVarLong(long value, DataOutputStream output) throws IOException {
+        while ((value & ~0x7fL) != 0) {
+            output.writeByte(((int) value & 0x7f) | 0x80);
+            value >>>= 7;
+        }
+        output.writeByte((int) value);
+    }
+
+    private static int unsignedVarLongSize(long value) {
+        int size = 1;
+        while ((value & ~0x7fL) != 0) { size++; value >>>= 7; }
+        return size;
     }
 
     private static void writeList(ListTag list, DataOutputStream output, int depth, WriteState state)
@@ -251,8 +310,8 @@ public final class NbtBinaryCodec {
                 case STRING -> StringTag.valueOf(readString());
                 case LIST -> readList(depth);
                 case COMPOUND -> readCompound(depth);
-                case INT_ARRAY -> new IntArrayTag(readIntArray(readLength()));
-                case LONG_ARRAY -> new LongArrayTag(readLongArray(readLength()));
+                case INT_ARRAY -> new IntArrayTag(readIntArray());
+                case LONG_ARRAY -> new LongArrayTag(readLongArray());
                 default -> throw new IOException("Unsupported NBT tag type " + type);
             };
         }
@@ -348,18 +407,66 @@ public final class NbtBinaryCodec {
             return result;
         }
 
-        private int[] readIntArray(int length) throws IOException {
-            requireBytes((long) length * Integer.BYTES);
+        private int[] readIntArray() throws IOException {
+            int header = readLength();
+            int length = header >>> 1;
+            boolean compact = (header & 1) != 0;
+            requireBytes(compact ? length : (long) length * Integer.BYTES);
             int[] result = new int[length];
-            for (int index = 0; index < length; index++) result[index] = readInt();
+            for (int index = 0; index < length; index++) {
+                if (compact) {
+                    int value = readUnsignedVarInt();
+                    result[index] = (value >>> 1) ^ -(value & 1);
+                } else {
+                    result[index] = readInt();
+                }
+            }
             return result;
         }
 
-        private long[] readLongArray(int length) throws IOException {
-            requireBytes((long) length * Long.BYTES);
+        private long[] readLongArray() throws IOException {
+            int header = readLength();
+            int length = header >>> 1;
+            boolean compact = (header & 1) != 0;
+            requireBytes(compact ? length : (long) length * Long.BYTES);
             long[] result = new long[length];
-            for (int index = 0; index < length; index++) result[index] = readLong();
+            for (int index = 0; index < length; index++) {
+                if (compact) {
+                    long value = readUnsignedVarLong();
+                    result[index] = (value >>> 1) ^ -(value & 1L);
+                } else {
+                    result[index] = readLong();
+                }
+            }
             return result;
+        }
+
+        private int readUnsignedVarInt() throws IOException {
+            int value = 0;
+            for (int index = 0; index < 5; index++) {
+                int current = readUnsignedByte();
+                if (index == 4 && (current & 0xf0) != 0) throw new IOException("ICF NBT int array value overflows");
+                value |= (current & 0x7f) << (index * 7);
+                if ((current & 0x80) == 0) {
+                    if (index > 0 && (current & 0x7f) == 0) throw new IOException("Non-canonical ICF NBT int array value");
+                    return value;
+                }
+            }
+            throw new IOException("Malformed ICF NBT int array value");
+        }
+
+        private long readUnsignedVarLong() throws IOException {
+            long value = 0;
+            for (int index = 0; index < 10; index++) {
+                int current = readUnsignedByte();
+                if (index == 9 && (current & 0xfe) != 0) throw new IOException("ICF NBT long array value overflows");
+                value |= (long) (current & 0x7f) << (index * 7);
+                if ((current & 0x80) == 0) {
+                    if (index > 0 && (current & 0x7f) == 0) throw new IOException("Non-canonical ICF NBT long array value");
+                    return value;
+                }
+            }
+            throw new IOException("Malformed ICF NBT long array value");
         }
 
         private int readLength() throws IOException {
