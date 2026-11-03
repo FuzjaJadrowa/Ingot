@@ -24,7 +24,9 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 public final class NbtBinaryCodec {
@@ -41,7 +43,7 @@ public final class NbtBinaryCodec {
     private static final int COMPOUND = 10;
     private static final int INT_ARRAY = 11;
     private static final int LONG_ARRAY = 12;
-    private static final byte[] CURRENT_ENCODING_MAGIC = {'N', 'B', 'T', 2};
+    private static final byte[] CURRENT_ENCODING_MAGIC = {'N', 'B', 'T', 1};
 
     public record Limits(int maxBytes, int maxDepth, int maxNodes, int maxStringChars) {
         public Limits {
@@ -89,7 +91,7 @@ public final class NbtBinaryCodec {
             if (value == null || value.getId() == END) throw new IOException("Invalid EndTag compound entry");
             state.addNode();
             output.writeByte(value.getId());
-            writeString(name, output, state.maxBytes());
+            writeString(name, output, state);
             writeTagPayload(value, output, depth + 1, state);
         }
         output.writeByte(END);
@@ -110,7 +112,7 @@ public final class NbtBinaryCodec {
                 writeLength(value.length, output);
                 output.write(value);
             }
-            case STRING -> writeString(((StringTag) tag).getAsString(), output, state.maxBytes());
+            case STRING -> writeString(((StringTag) tag).getAsString(), output, state);
             case LIST -> writeList((ListTag) tag, output, depth, state);
             case COMPOUND -> writeCompound((CompoundTag) tag, output, depth, state);
             case INT_ARRAY -> {
@@ -144,16 +146,22 @@ public final class NbtBinaryCodec {
         }
     }
 
-    private static void writeString(String value, DataOutputStream output, int maxBytes) throws IOException {
+    private static void writeString(String value, DataOutputStream output, WriteState state) throws IOException {
+        Integer existing = state.stringIds.get(value);
+        if (existing != null) {
+            writeLength(existing * 2 + 1, output);
+            return;
+        }
         long encodedBytes = 0;
         for (int index = 0; index < value.length(); index++) {
             char unit = value.charAt(index);
             encodedBytes += unit <= 0x7f ? 1 : unit <= 0x7ff ? 2 : 3;
-            if (encodedBytes > maxBytes || value.length() > maxBytes / 2) {
+            if (encodedBytes > state.maxBytes() || value.length() > state.maxBytes() / 2) {
                 throw new IOException("ICF NBT string exceeds byte limit");
             }
         }
-        writeLength((int) encodedBytes, output);
+        if (encodedBytes > Integer.MAX_VALUE / 2) throw new IOException("ICF NBT string is too long");
+        writeLength((int) encodedBytes * 2, output);
         for (int index = 0; index < value.length(); index++) {
             int unit = value.charAt(index);
             if (unit <= 0x7f) {
@@ -167,6 +175,7 @@ public final class NbtBinaryCodec {
                 output.writeByte(0x80 | (unit & 0x3f));
             }
         }
+        state.stringIds.put(value, state.stringIds.size());
     }
 
     private static boolean hasCurrentEncodingMagic(byte[] bytes) {
@@ -190,6 +199,7 @@ public final class NbtBinaryCodec {
     private static final class WriteState {
         private final int maxBytes;
         private int nodes;
+        private final Map<String, Integer> stringIds = new HashMap<>();
 
         private WriteState(int maxBytes) { this.maxBytes = maxBytes; }
         private int maxBytes() { return maxBytes; }
@@ -206,6 +216,7 @@ public final class NbtBinaryCodec {
         private final Limits limits;
         private int offset;
         private int nodes;
+        private final List<String> strings = new ArrayList<>();
 
         private Reader(byte[] bytes, Limits limits) {
             this.bytes = bytes;
@@ -271,7 +282,13 @@ public final class NbtBinaryCodec {
         }
 
         private String readString() throws IOException {
-            int length = readLength();
+            int token = readLength();
+            if ((token & 1) != 0) {
+                int id = token >>> 1;
+                if (id >= strings.size()) throw new IOException("Invalid ICF NBT string reference");
+                return strings.get(id);
+            }
+            int length = token >>> 1;
             requireBytes(length);
             int chars = decodeUtf8CodeUnits(offset, length, null);
             if (chars > limits.maxStringChars()) {
@@ -280,7 +297,12 @@ public final class NbtBinaryCodec {
             char[] value = new char[chars];
             decodeUtf8CodeUnits(offset, length, value);
             offset += length;
-            return new String(value);
+            String decoded = new String(value);
+            if (strings.size() >= (long) limits.maxNodes() * 2) {
+                throw new IOException("ICF NBT string table exceeds configured limit");
+            }
+            strings.add(decoded);
+            return decoded;
         }
 
         private int decodeUtf8CodeUnits(int start, int length, char[] output) throws IOException {

@@ -58,6 +58,7 @@ val benchmarkSourceSet = sourceSets.create("benchmark") {
     compileClasspath += sourceSets.main.get().output
     runtimeClasspath += output + compileClasspath
 }
+neoForge.addModdingDependenciesTo(benchmarkSourceSet)
 configurations[benchmarkSourceSet.implementationConfigurationName]
     .extendsFrom(configurations["implementation"])
 tasks.register<JavaExec>("compressionBenchmark") {
@@ -72,6 +73,20 @@ tasks.register<JavaExec>("compressionBenchmark") {
         require(dataset.isPresent) { "Pass -PbenchmarkData=<directory> containing vanilla, block_entities and low_compressibility folders" }
         args(rootProject.file(dataset.get()).absolutePath, report.get().asFile.absolutePath)
         systemProperty("ingot.version", project.version.toString())
+        systemProperty("ingot.minecraft", minecraftVersion)
+    }
+}
+tasks.register<JavaExec>("serializationBenchmark") {
+    description = "Compares NBT and ICF payload sizes and serialization times on supplied chunk datasets."
+    group = "verification"
+    dependsOn(benchmarkSourceSet.classesTaskName)
+    classpath = benchmarkSourceSet.runtimeClasspath
+    mainClass.set("pl.fuzjajadrowa.ingot.benchmark.SerializationBenchmark")
+    val dataset = providers.gradleProperty("benchmarkData")
+    val report = layout.buildDirectory.dir("reports/ingot-benchmark")
+    doFirst {
+        require(dataset.isPresent) { "Pass -PbenchmarkData=<directory> containing vanilla, block_entities and low_compressibility folders" }
+        args(rootProject.file(dataset.get()).absolutePath, report.get().asFile.absolutePath)
         systemProperty("ingot.minecraft", minecraftVersion)
     }
 }

@@ -12,10 +12,64 @@ import org.junit.Test;
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.util.Random;
 
 import static org.junit.Assert.*;
 
 public class NbtBinaryCodecTest {
+    @Test public void deterministicRandomTreesRoundTripAndMutationsFailSafely() throws Exception {
+        long seed = 0x4943465f5631L;
+        Random random = new Random(seed);
+        NbtBinaryCodec.Limits limits = NbtBinaryCodec.Limits.forRawBytes(64 * 1024);
+
+        try {
+            for (int sample = 0; sample < 256; sample++) {
+                CompoundTag original = randomCompound(random, 0);
+                byte[] encoded = NbtBinaryCodec.encode(original, limits.maxBytes());
+                assertEquals("seed=" + seed + ", sample=" + sample, original,
+                        NbtBinaryCodec.decode(encoded, limits));
+
+                for (int mutation = 0; mutation < 2; mutation++) {
+                    byte[] damaged = encoded.clone();
+                    int index = random.nextInt(damaged.length);
+                    damaged[index] ^= (byte) (1 << random.nextInt(8));
+                    try {
+                        NbtBinaryCodec.decode(damaged, limits);
+                    } catch (IOException expected) {
+                        // Unknown mutations are rejected by the codec
+                    }
+                }
+            }
+        } catch (AssertionError | RuntimeException failure) {
+            throw new AssertionError("Deterministic NBT fuzz failed with seed=" + seed, failure);
+        }
+    }
+
+    private static CompoundTag randomCompound(Random random, int depth) {
+        CompoundTag compound = new CompoundTag();
+        int entries = random.nextInt(6);
+        for (int index = 0; index < entries; index++) {
+            String key = "k" + index;
+            switch (random.nextInt(depth < 4 ? 8 : 7)) {
+                case 0: compound.putByte(key, (byte) random.nextInt()); break;
+                case 1: compound.putInt(key, random.nextInt()); break;
+                case 2: compound.putLong(key, random.nextLong()); break;
+                case 3: compound.putString(key, "s" + random.nextInt() + "☃"); break;
+                case 4: compound.putByteArray(key, new byte[random.nextInt(24)]); break;
+                case 5:
+                    ListTag strings = new ListTag();
+                    for (int item = random.nextInt(5); item > 0; item--) {
+                        strings.add(StringTag.valueOf("v" + random.nextInt(1000)));
+                    }
+                    compound.put(key, strings);
+                    break;
+                case 6: compound.putIntArray(key, new int[random.nextInt(12)]); break;
+                default: compound.put(key, randomCompound(random, depth + 1)); break;
+            }
+        }
+        return compound;
+    }
+
     @Test public void roundTripsEveryTagTypeAndPreservesFloatingPointBitsAndTypedEmptyLists() throws Exception {
         CompoundTag root = new CompoundTag();
         root.putByte("byte", (byte) 0xff);
@@ -83,21 +137,50 @@ public class NbtBinaryCodecTest {
         CompoundTag current = new CompoundTag();
         current.putString("value", "abcdefghijklmnopqrst");
         byte[] compact = NbtBinaryCodec.encode(current, 1024);
-        assertArrayEquals(new byte[] {'N', 'B', 'T', 2}, java.util.Arrays.copyOf(compact, 4));
-        assertTrue("Compact ASCII string payload should be smaller than the previous UTF-16 encoding", compact.length < 54);
+        assertArrayEquals(new byte[] {'N', 'B', 'T', 1}, java.util.Arrays.copyOf(compact, 4));
         assertEquals(current.getString("value"), NbtBinaryCodec.decode(compact,
                 NbtBinaryCodec.Limits.forRawBytes(1024)).getString("value"));
 
     }
 
+    @Test public void repeatedChunkPaletteStringsUseCompactReferences() throws Exception {
+        CompoundTag root = new CompoundTag();
+        ListTag sections = new ListTag();
+        for (int section = 0; section < 16; section++) {
+            CompoundTag entry = new CompoundTag();
+            entry.putByte("Y", (byte) section);
+            CompoundTag states = new CompoundTag();
+            ListTag palette = new ListTag();
+            for (int state = 0; state < 8; state++) {
+                CompoundTag block = new CompoundTag();
+                block.putString("Name", "minecraft:stone");
+                CompoundTag properties = new CompoundTag();
+                properties.putString("axis", "y");
+                block.put("Properties", properties);
+                palette.add(block);
+            }
+            states.put("palette", palette);
+            entry.put("block_states", states);
+            sections.add(entry);
+        }
+        root.put("sections", sections);
+
+        byte[] encoded = NbtBinaryCodec.encode(root, 64 * 1024);
+        CompoundTag decoded = NbtBinaryCodec.decode(encoded,
+                NbtBinaryCodec.Limits.forRawBytes(64 * 1024));
+        assertEquals(root, decoded);
+        assertTrue("Repeated section and palette strings should be represented by dictionary references",
+                encoded.length < 16 * 8 * 55);
+    }
+
     @Test public void rejectsMalformedCompactStringSequences() throws Exception {
-        byte[] overlongAscii = {'N', 'B', 'T', 2, 8, 1, 'k', 2, (byte) 0xc0, (byte) 0x80, 0};
+        byte[] overlongAscii = {'N', 'B', 'T', 1, 8, 1, 'k', 2, (byte) 0xc0, (byte) 0x80, 0};
         try {
             NbtBinaryCodec.decode(overlongAscii, NbtBinaryCodec.Limits.forRawBytes(128));
             fail("Overlong string encoding must be rejected");
         } catch (IOException expected) { }
 
-        byte[] truncatedSequence = {'N', 'B', 'T', 2, 8, 1, 'k', 1, (byte) 0xc2, 0};
+        byte[] truncatedSequence = {'N', 'B', 'T', 1, 8, 1, 'k', 1, (byte) 0xc2, 0};
         try {
             NbtBinaryCodec.decode(truncatedSequence, NbtBinaryCodec.Limits.forRawBytes(128));
             fail("Truncated string sequence must be rejected");
